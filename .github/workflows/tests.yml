@@ -1,34 +1,208 @@
-name: tests
+name: CI
 
 on:
   push:
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONUNBUFFERED: "1"
 
 jobs:
-  test:
+  quality:
+    name: Quality, coverage, and package
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install project and development tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Ruff lint
+        run: ruff check .
+
+      - name: Ruff format
+        run: ruff format --check .
+
+      - name: Type check
+        run: mypy src tests
+
+      - name: Compile sources
+        run: python -m compileall -q src tests mc_failover_proxy.py
+
+      - name: Test source-checkout compatibility entrypoint
+        run: |
+          python -I -S mc_failover_proxy.py --version
+          python -I -S mc_failover_proxy.py --config config.example.toml --check-config
+
+      - name: Tests with branch coverage
+        env:
+          PYTHONASYNCIODEBUG: "1"
+        run: >-
+          pytest
+          --cov=mc_failover
+          --cov-branch
+          --cov-report=term-missing
+          --cov-report=xml
+
+      - name: Build source distribution and wheel
+        run: python -m build
+
+      - name: Verify release archive hygiene
+        run: python tools/check_release_archives.py dist
+
+      - name: Install and smoke-test wheel outside the checkout
+        run: |
+          set -euo pipefail
+          wheels=("$GITHUB_WORKSPACE"/dist/*.whl)
+          test "${#wheels[@]}" -eq 1
+          test -f "${wheels[0]}"
+          smoke_root="$(mktemp -d "$RUNNER_TEMP/mc-failover-wheel.XXXXXX")"
+          trap 'rm -rf "$smoke_root"' EXIT
+          python -m venv "$smoke_root/venv"
+          mkdir "$smoke_root/run"
+          cp mc_failover_proxy.py config.example.toml "$smoke_root/run/"
+          cd "$smoke_root/run"
+          test ! -e src
+          smoke_python="$smoke_root/venv/bin/python"
+          smoke_cli="$smoke_root/venv/bin/mc-failover"
+          env -u PYTHONPATH "$smoke_python" -m pip install "${wheels[0]}"
+          env -u PYTHONPATH "$smoke_cli" --version
+          env -u PYTHONPATH "$smoke_cli" --config config.example.toml --check-config
+          env -u PYTHONPATH "$smoke_python" -I -m mc_failover --version
+          env -u PYTHONPATH "$smoke_python" -I -m mc_failover \
+            --config config.example.toml --check-config
+          env -u PYTHONPATH "$smoke_python" -I mc_failover_proxy.py --version
+          env -u PYTHONPATH "$smoke_python" -I mc_failover_proxy.py \
+            --config config.example.toml --check-config
+          env -u PYTHONPATH GITHUB_WORKSPACE="$GITHUB_WORKSPACE" \
+            "$smoke_python" -I -c 'from importlib import metadata; from pathlib import Path; import mc_failover, os; checkout = Path(os.environ["GITHUB_WORKSPACE"]).resolve(); origin = Path(mc_failover.__file__).resolve(); assert not origin.is_relative_to(checkout), (origin, checkout); assert mc_failover.__version__ == metadata.version("minecraft-failover-proxy")'
+
+      - name: Audit installed dependencies
+        run: python -m pip_audit --local --skip-editable
+
+  compatibility:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
-
+        # Python 3.13 is covered by the quality/coverage job above.
+        python-version: ["3.10", "3.11", "3.12", "3.14"]
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install dependencies
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install project and test tools
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements-dev.txt
-      - name: Ruff
-        run: ruff check .
-      - name: Black
-        run: black --check .
-      - name: Compile entrypoint
-        run: python -m py_compile mc_failover_proxy.py
-      - name: Compile all
-        run: python -m compileall .
-      - name: Tests
+          python -m pip install -e ".[dev]"
+
+      - name: Run test suite
+        env:
+          PYTHONASYNCIODEBUG: "1"
         run: pytest -q
+
+  container:
+    name: Container build and Compose validation
+    needs: [quality, compatibility]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build container image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: minecraft-failover-proxy:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+
+      - name: Verify container liveness and graceful SIGTERM
+        run: |
+          set -euo pipefail
+          container="mc-failover-ci-${GITHUB_RUN_ID}"
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          docker run --detach \
+            --name "$container" \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --health-interval 1s \
+            --health-start-period 1s \
+            --health-timeout 3s \
+            --health-retries 2 \
+            --volume "$GITHUB_WORKSPACE/config.example.toml:/config/config.toml:ro" \
+            minecraft-failover-proxy:ci
+          health="starting"
+          for _ in {1..30}; do
+            health="$(docker inspect --format '{{.State.Health.Status}}' "$container")"
+            if [[ "$health" == "healthy" ]]; then
+              break
+            fi
+            if [[ "$health" == "unhealthy" ]]; then
+              docker inspect "$container"
+              docker logs "$container"
+              exit 1
+            fi
+            sleep 1
+          done
+          test "$health" = "healthy"
+          docker kill --signal STOP "$container"
+          for _ in {1..20}; do
+            health="$(docker inspect --format '{{.State.Health.Status}}' "$container")"
+            if [[ "$health" == "unhealthy" ]]; then
+              break
+            fi
+            sleep 1
+          done
+          test "$health" = "unhealthy"
+          docker kill --signal CONT "$container"
+          for _ in {1..20}; do
+            health="$(docker inspect --format '{{.State.Health.Status}}' "$container")"
+            if [[ "$health" == "healthy" ]]; then
+              break
+            fi
+            sleep 1
+          done
+          test "$health" = "healthy"
+          docker stop --time 15 "$container"
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$container")" = "0"

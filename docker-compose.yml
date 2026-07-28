@@ -1,13 +1,40 @@
 services:
   mc-failover:
-    build: .
-    container_name: mc-failover
+    build:
+      context: .
+    image: minecraft-failover-proxy:local
     restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    stop_grace_period: 60s
     ports:
       - "25565:25565/tcp"
+      # Optional host access to monitoring: also configure
+      # listen_host="0.0.0.0", allow_remote=true and bearer_token.
+      # Loopback-only monitoring remains available to the image HEALTHCHECK.
       # - "127.0.0.1:8080:8080/tcp"
     volumes:
-      - ./config.toml:/config/config.toml:ro
-    # Optional on Linux if the container must reach services on the host:
+      - type: bind
+        source: ./config.toml
+        target: /config/config.toml
+        read_only: true
+        bind:
+          create_host_path: false
+      # Optional host-managed maintenance flags; set the configured paths to
+      # /state/force_fallback and /state/force_main. The proxy needs read access only.
+      # - type: bind
+      #   source: ./state
+      #   target: /state
+      #   read_only: true
+      #   bind:
+      #     create_host_path: false
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    # Optional on Linux when MAIN/FALLBACK run directly on the Docker host:
     # extra_hosts:
     #   - "host.docker.internal:host-gateway"

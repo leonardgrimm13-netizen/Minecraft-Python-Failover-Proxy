@@ -1,24 +1,57 @@
 [Unit]
 Description=Minecraft Python Failover Proxy
 Documentation=https://github.com/leonardgrimm13-netizen/Minecraft-Python-Failover-Proxy
-After=network-online.target
 Wants=network-online.target
+After=network-online.target
 
 [Service]
-Type=simple
+Type=exec
 User=mcfailover
 Group=mcfailover
-WorkingDirectory=/opt/mc-failover
-ExecStart=/usr/bin/python3 /opt/mc-failover/mc_failover_proxy.py --config /etc/mc-failover/config.toml
-Restart=always
-RestartSec=3
+WorkingDirectory=/var/lib/mc-failover
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONFAULTHANDLER=1
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/opt/mc-failover/.venv/bin/mc-failover --config /etc/mc-failover/config.toml --check-config
+ExecStart=/opt/mc-failover/.venv/bin/mc-failover --config /etc/mc-failover/config.toml
+Restart=on-failure
+RestartSec=3s
+TimeoutStartSec=30s
+TimeoutStopSec=60s
+KillSignal=SIGTERM
+KillMode=control-group
+
+RuntimeDirectory=mc-failover
+RuntimeDirectoryMode=0750
+StateDirectory=mc-failover
+StateDirectoryMode=0750
+UMask=0027
+LimitNOFILE=16384
+
 NoNewPrivileges=true
+PrivateDevices=true
 PrivateTmp=true
-ProtectSystem=full
+ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/mc-failover /run/mc-failover
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+SystemCallArchitectures=native
 CapabilityBoundingSet=
 AmbientCapabilities=
+ReadOnlyPaths=/etc/mc-failover
 
 [Install]
 WantedBy=multi-user.target
