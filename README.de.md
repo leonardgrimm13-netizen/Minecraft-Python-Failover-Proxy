@@ -1,550 +1,419 @@
 # Minecraft Python Failover Proxy
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Plattform: Linux](https://img.shields.io/badge/Platform-Linux-informational.svg)](https://kernel.org/)
-[![Tests](https://github.com/leonardgrimm13-netizen/Minecraft-Python-Failover-Proxy/actions/workflows/tests.yml/badge.svg)](https://github.com/leonardgrimm13-netizen/Minecraft-Python-Failover-Proxy/actions/workflows/tests.yml)
+[![Lizenz: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![CI](https://github.com/leonardgrimm13-netizen/Minecraft-Python-Failover-Proxy/actions/workflows/tests.yml/badge.svg)](https://github.com/leonardgrimm13-netizen/Minecraft-Python-Failover-Proxy/actions/workflows/tests.yml)
 
-Ein leichter Python-TCP-Failover-Proxy für Minecraft. Er leitet **neue Verbindungen** abhängig von der Erreichbarkeit des Hauptservers entweder an **MAIN** oder **FALLBACK** weiter. Die Konfiguration erfolgt per TOML (`config.toml`).
+[English](README.md)
 
-## Überblick
+Ein schlanker, AsyncIO-basierter TCP-Failover-Proxy für Minecraft unter Linux. Er leitet jede
+**neue TCP-Verbindung** anhand unabhängiger aktiver Health-Zustände, der Wartungsrichtlinie und
+passiver MAIN-Verbindungsfehler an MAIN oder FALLBACK weiter.
 
-- Spieler verbinden sich auf den Listen-Port des Proxys.
-- Der Proxy prüft den MAIN-Server in festen Intervallen.
-- Ist MAIN erreichbar, werden neue Spieler an MAIN weitergeleitet.
-- Ist MAIN nicht erreichbar, werden neue Spieler an FALLBACK (z. B. Lobby/Warteraum) weitergeleitet.
-- Bereits verbundene Spieler werden **nicht** live umgezogen.
+Die grundlegende Grenze ist beabsichtigt: Bestehende Spielersitzungen bleiben mit dem beim
+Verbindungsaufbau gewählten Backend verbunden. Der Proxy kann einen bereits verbundenen Spieler
+nach einem Backend-Ausfall nicht live migrieren.
 
-> Der Proxy entscheidet nur bei neuen TCP-Verbindungen. Bereits verbundene Spieler können nicht automatisch live auf den Fallback-Server migriert werden.
-
-## Architektur (Textgrafik)
+## Architektur und Routing
 
 ```text
-Spieler
-   |
-   v
-Minecraft Python Failover Proxy
-   |------------------> MAIN / Hauptserver
-   |
-   \------------------> FALLBACK / Warteraum
+Minecraft-Clients
+       |
+       v
+mc-failover Listener
+       |---- MAIN      (aktiver Healthcheck + passiver Circuit Breaker)
+       `---- FALLBACK  (unabhängiger aktiver Healthcheck)
+
+Monitoring-Listener (optional): /live /ready /health /state /metrics
 ```
 
-## Funktionen
+MAIN- und FALLBACK-Prüfung starten parallel, bevor die Listener freigegeben werden. Jedes Ziel
+besitzt einen eigenen Status, aufeinanderfolgende Erfolgs-/Fehlerzähler, Gesamtzähler,
+Zeitstempel und Hysterese.
 
-- TCP-Proxy für Minecraft-Traffic
-- MAIN/FALLBACK frei konfigurierbar
-- TOML-Konfiguration (`config.toml`)
-- Healthcheck-Modus `tcp` (empfohlener Standard)
-- Optionaler Modus `minecraft_status`
-- Failover-Schwelle `fail_after`
-- Recovery-Schwelle `recover_after`
-- Konfigurierbares Logging-Level
-- systemd-tauglicher Betrieb auf Linux
-- Python 3.10+
-- Unit-Tests + GitHub Actions (3.10, 3.11, 3.12)
+Bei `maintenance.mode = "auto"` gilt:
 
-## Voraussetzungen
+| MAIN | FALLBACK | Circuit | Ergebnis für eine neue Verbindung |
+|---|---|---|---|
+| routable | beliebig | closed | MAIN; Gesamtstatus nur bei beiden bestätigten healthy Zielen healthy, sonst degraded |
+| nicht verfügbar | routable | beliebig | FALLBACK, degraded |
+| routable | routable | open/half-open | FALLBACK, außer einem begrenzten Half-Open-MAIN-Test |
+| nicht verfügbar | nicht verfügbar | beliebig | kein Ziel; Verbindung wird geschlossen und Readiness ist 503 |
 
-- Linux-Server/VPS empfohlen
-- Python 3.10+
-- Offener Firewall-Port für den Proxy (standardmäßig `25565/tcp`)
-- MAIN und FALLBACK müssen vom Proxy-Host aus erreichbar sein
-- Bei Python 3.10: `tomli` über `requirements.txt` installieren
+`force_main` und `force_fallback` sind Fail-Closed-Richtlinien, keine Präferenzen. Ist das
+erzwungene Ziel unhealthy oder wird MAIN von seinem Circuit blockiert, leitet der Proxy
+**nicht** zum anderen Ziel: Das aktive Ziel ist `NONE`, der Grund lautet
+`forced_main_unavailable` oder `forced_fallback_unavailable`, und `/ready` sowie `/health`
+antworten mit 503. `force_main` kann nach Ablauf der Open-Zeit nur einen kontrollierten
+Half-Open-Test verwenden. Auch ein verwendbares erzwungenes Ziel wird als degraded gemeldet, weil
+der Operator die automatische Richtlinie überschreibt.
 
-## Installation
+Ein statischer Wartungsmodus hat Vorrang vor Dateien. In `auto` werden die Dateien außerhalb des
+Verbindungs-Hot-Paths abgefragt; `force_fallback_file` gewinnt, wenn beide Dateien existieren.
 
-```bash
-git clone https://github.com/leonardgrimm13-netizen/Minecraft-Python-Failover-Proxy.git
-cd Minecraft-Python-Failover-Proxy
-python3 -m pip install -r requirements.txt
-```
+### Aktive Healthchecks
 
-Optional mit virtual environment:
+- `tcp` öffnet und schließt eine TCP-Verbindung. Das beweist, dass ein Listener eine Verbindung
+  angenommen hat, nicht dass ein Minecraft-Server Welten, Plugins oder Datenbanken vollständig
+  geladen hat.
+- `minecraft_status` führt einen begrenzten Status-Handshake aus und validiert das Antwortpaket.
+  Optional werden gültiges JSON, Versions-/MOTD-Filter, eine Latenzobergrenze und ein minimales
+  `players.max` verlangt. JSON-abhängige Filter benötigen `require_valid_json = true`.
+- `version.protocol` aus der Antwort wird als vorzeichenbehafteter 32-Bit-Integer validiert. Paper
+  kann während des Starts legitim `-1` melden; das JSON bleibt strukturell gültig, aber der sichere
+  Default `reject_uninitialized_protocol = true` lässt den Check mit
+  `status_server_not_initialized` fehlschlagen. Setze die Option je Ziel nur dann auf `false`, wenn
+  dieser Startzustand bereits als ready gelten soll. Im Modus `minecraft_status` benötigt der
+  Filter die Validierung des JSON. Zur rückwärtskompatiblen Migration bleibt der Filter
+  deaktiviert, wenn eine ältere Konfiguration ausdrücklich `require_valid_json = false` setzt und
+  die neue Option weglässt; eine explizite Kombination aus
+  `reject_uninitialized_protocol = true` und deaktivierter JSON-Validierung wird abgelehnt.
+- Eine absolute `timeout_seconds`-Deadline umfasst die gesamte Prüfung einschließlich DNS,
+  Connect, Schreiben und Lesen. Eine hängende Prüfung stoppt die Task des anderen Ziels nicht.
+- Mit `target_host`/`target_port` kann ein Backend hinter einem Routing-Proxy geprüft werden,
+  während Spielertraffic weiterhin zum konfigurierten Routing-Ziel fließt.
+
+Das Deaktivieren eines aktiven Checks ist ein ausdrücklich optimistisches Opt-out. Der Zustand
+wird unbekannt, das Ziel bleibt jedoch routable. Readiness kann deshalb true sein, während der
+Gesamtstatus degraded lautet; ein realer Connect kann trotzdem fehlschlagen. Ist allein FALLBACK
+unhealthy oder ungeprüft, bleibt MAIN ready, der Verlust der Failover-Kapazität macht den
+Gesamtstatus jedoch degraded. Lasse beide Checks aktiviert, wenn Readiness aktuelle
+Erreichbarkeit nachweisen soll.
+
+### Passive Fehler und Circuit Breaker
+
+Fehlgeschlagene reale MAIN-Connects werden in einem monotonen gleitenden Zeitfenster gezählt. Bei
+`failure_threshold` öffnet der Circuit für `open_seconds`; neue automatische Verbindungen umgehen
+den MAIN-Timeout und verwenden den routable FALLBACK. Danach dürfen höchstens
+`half_open_max_attempts` Tests gleichzeitig MAIN versuchen. Ein erfolgreicher echter Connect
+schließt und leert den Circuit, ein fehlgeschlagener Test öffnet ihn erneut. Ein erfolgreicher
+aktiver MAIN-Check darf ihn erst nach Ablauf der vollständigen Open-Zeit schließen.
+
+FALLBACK-Connect-Fehler haben eigene Metriken, lösen aber keine rekursive weitere Route aus; es
+entsteht keine MAIN/FALLBACK-Endlosschleife. Mit
+`connect_fallback_on_main_connect_failure = true` darf ein fehlgeschlagener MAIN-Connect genau
+einen unmittelbaren FALLBACK-Versuch durchführen, nur in `auto` und nur bei routable FALLBACK.
+
+## TCP-Relay und Herunterfahren
+
+Das Relay transportiert reines TCP; es terminiert kein TLS und schreibt keine Minecraft-
+Loginpakete um. EOF wird, soweit von der Plattform unterstützt, mit `write_eof()` weitergegeben.
+Nach einem sauberen Half-Close darf die Gegenrichtung noch
+`relay_drain_timeout_seconds` weiterlaufen. So wird eine letzte Antwort nicht abgeschnitten, ohne
+eine unbegrenzte Task zu hinterlassen. Reads teilen eine sitzungsweite Idle-Deadline, Writes haben
+begrenzte `drain()`-Deadlines, und alle Relay-Tasks werden bei Erfolg, Fehler, Timeout oder
+Cancellation eingesammelt.
+
+SIGINT und SIGTERM starten Graceful Shutdown:
+
+1. Prozess als nicht ready markieren und Minecraft-/Monitoring-Listener schließen;
+2. Health-, Wartungs- und Monitoring-Tasks stoppen und einsammeln;
+3. bestehende Spielersitzungen bis `shutdown_grace_seconds` weiterlaufen lassen;
+4. verbleibende Sitzungen abbrechen, Writer-Cleanup mit
+   `shutdown_cancel_timeout_seconds` begrenzen und jede Task einsammeln.
+
+Ein regulärer signalgesteuerter Shutdown endet mit Status 0. Der Stop-Timeout des Service-Managers
+muss oberhalb der Summe aus Grace, Cancellation und Cleanup-Reserve liegen. Die mitgelieferten
+systemd-/Compose-Dateien verwenden für die Beispielwerte 30 + 5 Sekunden insgesamt 60 Sekunden
+und lassen damit zusätzliche Cleanup-Reserve.
+
+Dauern, Intervalle, Alter, Recovery, Idle-Deadlines und Circuit-Fenster verwenden eine monotone
+Uhr. Extern sichtbare Start-/Check-/Wechsel-/Open-Zeitstempel sind UTC mit Zeitzone und
+ISO-8601-`Z`; Prometheus-Zeitstempel-Gauges verwenden Unix-Sekunden. Sprünge der Systemuhr ändern
+keine Timeout-Dauern, und angezeigte Alter/Uptime werden nie negativ.
+
+## Voraussetzungen und Installation
+
+- Linux ist die primäre Zielplattform.
+- CPython 3.10 oder neuer (CI ist für 3.10 bis 3.14 konfiguriert).
+- MAIN und FALLBACK sind vom Proxy-Host erreichbar.
+
+Installation aus einem Checkout:
 
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate
-python3 -m pip install -r requirements.txt
+. .venv/bin/activate
+python -m pip install .
+cp config.example.toml config.toml
+mc-failover --config config.toml --check-config
+mc-failover --config config.toml
 ```
 
-Hinweise:
+`config.toml` wird absichtlich von Git ignoriert. Deployment-Konfiguration und ein eventuelles
+Monitoring-Token gehören nicht in die Versionsverwaltung.
 
-- Unter Python 3.11+ bringt `requirements.txt` für TOML in der Regel keine zusätzliche Runtime-Abhängigkeit (es wird `tomllib` aus der Standardbibliothek genutzt).
-- Unter Python 3.10 wird `tomli` benötigt und über `requirements.txt` installiert.
+### Migration von der Einzeldatei-Version
 
-## Konfiguration (`config.toml`)
+- Die Implementierung liegt jetzt in `src/mc_failover`; der installierte Befehl heißt
+  `mc-failover`.
+- `python mc_failover_proxy.py --config config.toml` bleibt als Kompatibilitäts-Entrypoint erhalten
+  und ruft die Paket-CLI auf.
+- Vorhandene Kernsektionen bleiben gültig. Neue Sektionen besitzen dokumentierte Defaults; der
+  unabhängige FALLBACK-Check ist standardmäßig als TCP-Check auf FALLBACK aktiv und übernimmt
+  Timing/Hysterese von MAIN.
+- Unbekannte Schlüssel sind standardmäßig Fehler (`[config].strict_unknown_keys = true`). Das
+  findet Tippfehler; korrigiere den Schlüssel, statt Strict Mode außer für eine gestufte Migration
+  zu deaktivieren.
+- Die früher unsichere Kombination `proxy_protocol.accept = true` mit leerer Vertrauensliste
+  schlägt jetzt bei der Validierung fehl. Ergänze vertrauenswürdige IP/CIDR-Einträge oder das
+  ausdrücklich gefährliche Opt-in `trust_all_proxies = true`.
+- Monitoring-Readiness ist nicht mehr bedingungslos positiv: `/ready` und `/health` liefern 503,
+  wenn keine verwendbare Route existiert.
 
-Vollständiges Beispiel:
+Führe vor dem Neustart eines aktualisierten Dienstes immer `--check-config` aus.
 
-```toml
-[proxy]
-listen_host = "0.0.0.0"
-listen_port = 25565
+## Konfiguration und CLI
 
-[main]
-host = "127.0.0.1"
-port = 25564
+[config.example.toml](config.example.toml) ist die vollständige kommentierte Referenz mit allen
+aktuellen Bereichen:
 
-[fallback]
-host = "127.0.0.1"
-port = 25566
+- striktes Parsing, Listener/Backlog, MAIN und FALLBACK;
+- beide Healthchecks und Minecraft-Statusfilter;
+- Connect-/Write-/Idle-/Drain-/Shutdown-Deadlines, globale/Per-IP-Limits und Token-Bucket-Rate-Limit;
+- Wartungsmodus und asynchron abgefragte Override-Dateien;
+- Circuit Breaker;
+- PROXY-Protocol-Vertrauen, Versionen, Deadline und Größenlimit;
+- geschütztes Monitoring und Access-Logging.
 
-[healthcheck]
-mode = "tcp"
-interval_seconds = 3.0
-timeout_seconds = 2.0
-fail_after = 2
-recover_after = 2
-min_recovery_seconds = 0.0
+Zahlen besitzen Grenzen; Booleans werden nie als Integer akzeptiert. Ziele dürfen nicht auf
+überlappende Proxy-/Monitoring-Listener zurückzeigen. Zusätzlich zur textuellen Prüfung werden
+DNS-Ziele mit gleichem Port innerhalb der absoluten Connect-Deadline aufgelöst und mit den
+tatsächlich gebundenen Sockets verglichen. Ein DNS-Fehler schlägt dabei Fail-Closed fehl;
+Wildcard-Listener sperren außerdem jede vom Kernel als lokal erkannte Adresse. Für den Connect
+werden die bereits geprüften numerischen Adressen einschließlich IPv6-Scope-ID verwendet, sodass
+keine zweite DNS-Auflösung die Schleife erneut einführen kann. Die beiden Rate-Limit-Werte müssen
+entweder beide null oder beide positiv sein; null deaktiviert Rate-/Per-IP-/Idle-Funktionen an den
+im Beispiel bezeichneten Stellen.
 
-[connection]
-timeout_seconds = 5.0
-buffer_size = 65536
-
-[maintenance]
-mode = "auto"
-force_fallback_file = "/var/lib/mc-failover/force_fallback"
-force_main_file = "/var/lib/mc-failover/force_main"
-
-[logging]
-level = "INFO"
-```
-
-| Option | Bedeutung | Typischer Wert |
-|---|---|---|
-| `proxy.listen_host` | Interface/IP, auf dem der Proxy lauscht | `0.0.0.0` |
-| `proxy.listen_port` | TCP-Port für eingehende Spieler | `25565` |
-| `main.host` | Hostname/IP des Hauptservers (MAIN) | `127.0.0.1` |
-| `main.port` | TCP-Port des Hauptservers | `25564` |
-| `fallback.host` | Hostname/IP des Fallback-Servers | `127.0.0.1` |
-| `fallback.port` | TCP-Port des Fallback-Servers | `25566` |
-| `healthcheck.mode` | Healthcheck-Typ: `tcp` oder `minecraft_status` | `tcp` |
-| `healthcheck.interval_seconds` | Intervall zwischen Prüfungen (Sekunden) | `3.0` |
-| `healthcheck.timeout_seconds` | Timeout pro Prüfvorgang (Sekunden) | `2.0` |
-| `healthcheck.fail_after` | Anzahl Fehlversuche bis Umschaltung auf FALLBACK | `2` |
-| `healthcheck.recover_after` | Anzahl Erfolge bis Rückschaltung auf MAIN | `2` |
-| `healthcheck.min_recovery_seconds` | Zusätzliche stabile Healthy-Zeit vor Rückschaltung (`0.0` = deaktiviert) | `30.0` |
-| `healthcheck.target_host` | Optionales Ziel für den Healthcheck-Host | `100.64.0.10` |
-| `healthcheck.target_port` | Optionales Ziel für den Healthcheck-Port | `25567` |
-| `healthcheck.protocol_version` | Protokollversion im Status-Handshake (Default) | `767` |
-| `healthcheck.status_hostname` | Optionaler Hostname im Status-Handshake | `survival.example.com` |
-| `healthcheck.require_valid_json` | Gültige JSON-Statusantwort erzwingen | `true` |
-| `healthcheck.log_status_details` | Erfolgreiche Version/Spieler/Latenz loggen | `false` |
-| `healthcheck.jitter_seconds` | Zufälliger Zusatz-Delay pro Check gegen gleichzeitige Bursts | `0.2` |
-| `healthcheck.max_latency_ms` | Maximale erlaubte Minecraft-Status-Latenz in ms (`0.0` = deaktiviert, funktioniert auch ohne JSON-Parsing) | `1500` |
-| `healthcheck.expected_version_contains` | Erforderlicher Textausschnitt in `version.name` beim `minecraft_status`-JSON (`""` = deaktiviert) | `1.21` |
-| `healthcheck.motd_must_contain` | Erforderlicher case-sensitiver Text in der MOTD (`""` = deaktiviert) | `READY` |
-| `healthcheck.motd_must_not_contain` | Verbotener case-sensitiver Text in der MOTD (`""` = deaktiviert) | `STARTING` |
-| `healthcheck.min_players_max` | Minimal erforderlicher `players.max`-Wert (`0` = deaktiviert) | `1` |
-| `connection.timeout_seconds` | Timeout für Upstream-Verbindungsaufbau | `5.0` |
-| `connection.buffer_size` | Puffergröße für TCP-Weiterleitung | `65536` |
-| `connection.idle_timeout_seconds` | Idle-Timeout für bestehende Proxy-Verbindungen (`0` = deaktiviert) | `300.0` |
-| `connection.connect_fallback_on_main_connect_failure` | Bei MAIN-Connect-Fehler sofort FALLBACK versuchen | `true` |
-| `connection.tcp_keepalive` | Aktiviert SO_KEEPALIVE auf Proxy-Sockets | `true` |
-| `connection.max_connections` | Hartes Limit für gleichzeitige Verbindungen | `4096` |
-| `maintenance.mode` | Routing-Modus: `auto`, `force_fallback`, `force_main` | `auto` |
-| `maintenance.force_fallback_file` | Existiert Datei, werden neue Spieler auf FALLBACK geleitet (ohne Neustart) | `/var/lib/mc-failover/force_fallback` |
-| `maintenance.force_main_file` | Existiert Datei, werden neue Spieler auf MAIN geleitet (ohne Neustart) | `/var/lib/mc-failover/force_main` |
-| `logging.level` | Logging-Level (`DEBUG`, `INFO`, ...) | `INFO` |
-
-Wichtige Einordnung:
-
-- `healthcheck.mode = "tcp"` ist der stabilste Standard in gemischten Umgebungen.
-- `minecraft_status` ist protokollnäher, kann aber je nach Server/Proxy/Version empfindlicher reagieren.
-- `fail_after` verhindert sofortiges Umschalten bei einzelnen Kurzstörungen.
-- `recover_after` verhindert zu frühes Zurückschalten und reduziert Flapping.
-- Code-Defaults sind bewusst konservativ/rückwärtskompatibel: `connect_fallback_on_main_connect_failure = false`, `tcp_keepalive = false`.
-- In `config.example.toml` sind beide bewusst als empfohlene Produktionswerte auf `true` gesetzt.
-- `idle_timeout_seconds = 0` deaktiviert den Idle-Disconnect vollständig.
-- `force_fallback_file` hat Vorrang vor `force_main_file`, wenn beide Dateien existieren.
-- Textfilter sind case-sensitive.
-- JSON-basierte Filter brauchen `require_valid_json = true`.
-- `max_latency_ms` funktioniert auch bei `require_valid_json = false`.
-
-
-## Recovery-Wartezeit nach MAIN-Rückkehr
-
-Minecraft-Server (Paper/Spigot/Velocity mit Plugins, Modpacks, Datenbanken) können TCP/Status oft schon beantworten, obwohl intern noch geladen wird.
-
-- `recover_after`: wie viele erfolgreiche Checks am Stück nötig sind.
-- `min_recovery_seconds`: zusätzliche durchgehende Healthy-Zeit nach der ersten erfolgreichen Antwort.
-
-Für `FALLBACK -> MAIN` müssen beide Bedingungen erfüllt sein. Mit `min_recovery_seconds = 0.0` bleibt das alte Verhalten erhalten.
-
-Beispiel:
-
-```toml
-[healthcheck]
-interval_seconds = 3.0
-fail_after = 2
-recover_after = 3
-min_recovery_seconds = 30.0
-```
-
-Bedeutung: Ausfall wird nach ca. 6 Sekunden erkannt; Rückschaltung erst nach 3 Erfolgs-Checks **und** mindestens 30 Sekunden stabiler Erreichbarkeit.
-Bei großen Modpacks oder Paper-Servern mit vielen Plugins sind 20-60 Sekunden oft sinnvoll.
-
-## Wartungsmodus / Force-Fallback
-
-- `maintenance.mode = "auto"`: normales Verhalten, Healthcheck entscheidet.
-- `maintenance.mode = "force_fallback"`: neue Spieler landen immer im FALLBACK/Warteraum.
-- `maintenance.mode = "force_main"`: neue Spieler landen immer auf MAIN.
-- Statischer Modus (`force_fallback`/`force_main`) hat Vorrang vor Datei-Overrides.
-- In `auto` werden Datei-Overrides bei jeder neuen Verbindung neu geprüft (wirkt ohne Neustart).
-
-Typische Admin-Befehle:
+Offline-CLI-Operationen starten keinen Listener:
 
 ```bash
-sudo mkdir -p /var/lib/mc-failover
-sudo touch /var/lib/mc-failover/force_fallback
-sudo rm /var/lib/mc-failover/force_fallback
+mc-failover --version
+mc-failover --config config.toml --check-config
+mc-failover --config config.toml --print-effective-config
+mc-failover --config config.toml --test-main
+mc-failover --config config.toml --test-fallback
+mc-failover --config config.toml --test-healthcheck
+mc-failover --config config.toml --test-fallback-healthcheck
+mc-failover --config config.toml --probe-live
 ```
 
-Warnung: `force_main` kann Spieler auf MAIN leiten, obwohl der Healthcheck MAIN als unhealthy bewertet. Nur bewusst einsetzen.
+`--test-main` und `--test-fallback` sind reine TCP-Tests. Die beiden Healthcheck-Befehle verwenden
+den konfigurierten Modus samt Filtern. `--probe-live` prüft den `/live`-Endpoint des bereits
+laufenden Monitoring-Listeners, sendet ein konfiguriertes Bearer-Token bei Bedarf intern und gibt
+es nie aus. Das ist eine Liveness-, keine Backend-Readiness-Prüfung. Die Ausgabe der effektiven
+Konfiguration schwärzt das Bearer-Token.
 
-## Velocity / Backend-Healthcheck
+## Monitoring und Prometheus
 
-Wenn MAIN auf Velocity zeigt, beweist ein reiner TCP-Check oft nur, dass Velocity läuft – nicht, dass das eigentliche Backend erreichbar ist.
-
-- `main.host` / `main.port` = Routing-Ziel für Spieler bei gesundem MAIN.
-- `healthcheck.target_host` / `healthcheck.target_port` = separates Prüfziel für die Gesundheitsentscheidung.
-
-Beispiel (zu Velocity routen, echtes Backend prüfen):
-
-Das Standardbeispiel nutzt `mode = "tcp"` für einen sicheren Erststart. Für ein Velocity-Setup, bei dem der echte Backend-Server hinter Velocity geprüft werden soll, stelle auf `mode = "minecraft_status"` um und setze `target_host`/`target_port`.
-
-
-```toml
-[main]
-host = "127.0.0.1"
-port = 25564
-
-[fallback]
-host = "127.0.0.1"
-port = 25566
-
-[healthcheck]
-mode = "minecraft_status"
-target_host = "100.64.0.10"
-target_port = 25567
-protocol_version = 767
-require_valid_json = true
-log_status_details = false
-interval_seconds = 3.0
-timeout_seconds = 2.0
-fail_after = 2
-recover_after = 2
-```
-
-Hinweise:
-- `protocol_version = 767` ist der Default und kann bei Bedarf angepasst werden.
-- `require_valid_json = true` erzwingt eine echte JSON-Statusantwort. Bei `false` reicht ein gültiger Status-Pakettyp.
-- `log_status_details = true` protokolliert Version/Spieler/Latenz und kann bei kurzem Intervall viel Log erzeugen.
-- Backend muss Status-Pings erlauben (`enable-status=true` in `server.properties`).
-- `nc -vz` zeigt nur TCP-Erreichbarkeit; `minecraft_status` prüft Minecraft-typisches Statusverhalten.
-
-## Erweiterter Minecraft-Status-Check
-
-Paper/Velocity/Modpacks können bereits auf Status-Pings antworten, obwohl Plugins, Welten oder Datenbanken noch laden.
-Mit den optionalen `minecraft_status`-Filtern kannst du die Readiness deutlich zuverlässiger prüfen.
-
-```toml
-[healthcheck]
-mode = "minecraft_status"
-target_host = "100.64.0.10"
-target_port = 25567
-require_valid_json = true
-expected_version_contains = "1.21"
-motd_must_contain = "READY"
-motd_must_not_contain = "STARTING"
-max_latency_ms = 1500
-min_players_max = 1
-```
-
-- `enable-status=true` in `server.properties` ist nötig.
-- Bei Velocity/Paper prüfen, welches Ziel den Status-Ping wirklich beantwortet.
-- Textfilter sind case-sensitive.
-- JSON-basierte Filter (`expected_version_contains`, `motd_*`, `min_players_max`) brauchen `require_valid_json = true`.
-- `max_latency_ms` funktioniert auch bei `require_valid_json = false`.
-- READY-MOTD-Praxis: während Start/Restart `STARTING`, nach vollständigem Start `READY`.
-- MOTD-Filter sind nur ein Konfigurationssignal und ersetzen keinen echten Plugin-Readiness-Check.
-
-## Start
+Fehlt die Sektion, bleibt Monitoring zur Kompatibilität mit älteren Konfigurationen deaktiviert.
+Die mitgelieferte Beispielkonfiguration aktiviert es ausschließlich auf `127.0.0.1:8080`, damit
+der Container seinen laufenden Eventloop prüfen kann, ohne den Port zu veröffentlichen. Ein
+nichtlokaler Bind wird ohne `allow_remote = true` abgelehnt; diese Regel wird vor Annahme von
+Requests nochmals gegen jeden tatsächlich gebundenen Socket geprüft. Remote-Monitoring benötigt
+zusätzlich ein Bearer-Token, außer der Operator setzt das deutlich unsichere Opt-in
+`allow_unauthenticated_remote = true`. Das Token wird zeitkonstant verglichen, schützt jeden
+Endpoint einschließlich `/live`, wird in Validierungsdiagnosen geschwärzt, erscheint nie in
+`--print-effective-config` oder `--probe-live` und wird nicht geloggt.
 
 ```bash
-python3 mc_failover_proxy.py
-python3 mc_failover_proxy.py --config /pfad/config.toml
+curl http://127.0.0.1:8080/live
+curl -H 'Authorization: Bearer DEIN_TOKEN' http://127.0.0.1:8080/ready
 ```
 
-- Standardpfad ist `./config.toml` im aktuellen Working Directory.
-- Für systemd ist `WorkingDirectory` deshalb wichtig.
+| Pfad | Status und Zweck |
+|---|---|
+| `/live` | 200, wenn Monitoring-Handler/Eventloop antwortet; Backend-Health ist irrelevant |
+| `/ready` | kompakter Routing-Zustand; 200 nur mit verwendbarer Route, sonst 503 |
+| `/health` | vollständiger Health-/Routing-/Circuit-/Uptime-Zustand; nach derselben Regel 200 oder 503 |
+| `/state` | Diagnosezustand, immer 200; konfigurierte Zielhosts/-ports nur mit `expose_sensitive_state = true` |
+| `/metrics` | Prometheus-Textformat, immer 200, solange Monitoring antwortet |
 
-## systemd-Service (Beispiel)
+`/ready` meldet `healthy`, `degraded` oder `unavailable` sowie das aktive Ziel und beide
+Health-Werte (`true`, `false` oder `null` bei unbekannt/deaktiviert). `/health` ergänzt
+UTC-Start-/Wechsel-/Check-Zeiten, monotone Uptime-/Check-Alter,
+Verbindungs- und Ablehnungszähler, Wartungsquelle, Routing-Grund, beide vollständigen letzten
+Check-Ergebnisse sowie Circuit-Zustand, Open-Zeit und Retry-Verzögerung.
 
-```ini
-[Unit]
-Description=Minecraft Python Failover Proxy
-After=network-online.target
-Wants=network-online.target
+Auch ohne Zieladressen zeigt `/state` operative Health-Daten, Routing-Gründe, Wartungsmodus,
+Zähler und Zeitstempel. Halte den Endpoint lokal oder authentifiziert. Der HTTP-Server akzeptiert
+nur GET, schließt jede Antwort, begrenzt Request-Zeile/Headeranzahl/-größe, verwendet eine absolute
+Request-Deadline und limitiert Monitoring-Clients unabhängig.
 
-[Service]
-Type=simple
-WorkingDirectory=/opt/mc-failover
-ExecStart=/usr/bin/python3 /opt/mc-failover/mc_failover_proxy.py --config /opt/mc-failover/config.toml
-Restart=always
-RestartSec=3
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ProtectHome=true
+Die Zähler des Verbindungslebenszyklus haben getrennte Bedeutungen.
+`incoming_connections_total` zählt jeden TCP-Accept des Minecraft-Listeners.
+`backend_connections_established_total` zählt Clients, für die ein Backend erfolgreich für das
+Relay vorbereitet wurde; `active_connections` ist die aktuell aktive Teilmenge davon.
+`connections_rejected_total` zählt explizite Ablehnungen durch Protokoll-, Zulassungs- und
+Routingprüfungen sowie endgültig fehlgeschlagene Backend-Connects, aber keinen MAIN-Fehler mit
+erfolgreichem FALLBACK. Unerwartete interne Handlerfehler werden geloggt, statt ihnen einen
+unbegrenzten oder irreführenden Ablehnungsgrund zuzuordnen. Die JSON-Felder `total_connections`
+(Zuteilungen des globalen Limiters) und `rejected_connections` bleiben als veraltete
+Kompatibilitätsfelder erhalten.
 
-[Install]
-WantedBy=multi-user.target
+Die Metriken enthalten `# HELP` und `# TYPE`, begrenzte Label-Werte und keine frei formulierten
+Fehlertexte als Label:
+
+```text
+mc_failover_up
+mc_failover_uptime_seconds
+mc_failover_shutting_down
+mc_failover_active_connections
+mc_failover_incoming_connections_total
+mc_failover_backend_connections_established_total
+mc_failover_connections_rejected_total
+mc_failover_connections_total
+mc_failover_rejected_connections_total
+mc_failover_monitoring_rejected_connections_total
+mc_failover_main_connect_failures_total
+mc_failover_fallback_connect_failures_total
+mc_failover_main_connect_successes_total
+mc_failover_fallback_connect_successes_total
+mc_failover_target_health_status
+mc_failover_healthcheck_successes_total
+mc_failover_healthcheck_failures_total
+mc_failover_healthcheck_latency_milliseconds
+mc_failover_healthcheck_age_seconds
+mc_failover_healthcheck_timestamp_seconds
+mc_failover_circuit_breaker_state
+mc_failover_circuit_breaker_open_total
+mc_failover_circuit_breaker_retry_after_seconds
+mc_failover_active_target
+mc_failover_routing_reason_info
 ```
 
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now mc-failover
-systemctl status mc-failover
-journalctl -u mc-failover -f
-```
+`mc_failover_connections_total` bleibt vorübergehend als veralteter Zähler der Verbindungen
+erhalten, denen der globale Limiter einen Platz zugeteilt hat. Eine solche Verbindung kann danach
+noch an Protokollvalidierung, verzögerter Zulassung, Routing oder Backend-Connect scheitern.
+`mc_failover_rejected_connections_total` ist eine veraltete Kompatibilitätsfamilie mit denselben
+Client-Ablehnungswerten; sie behält die historische, stets nullwertige Serie
+`reason="monitoring_limit"`. Monitoring-Überlastung zählt ausschließlich
+`mc_failover_monitoring_rejected_connections_total`.
 
-Hinweis: `ProtectHome=true` kann problematisch sein, wenn die Config im Home-Verzeichnis liegt. In der Praxis ist ein Pfad wie `/opt/mc-failover` meist besser, alternativ systemd-Sandboxing bewusst anpassen.
+## Sicherheit des PROXY Protocol
+
+Ein- und ausgehendes PROXY Protocol v1/v2 sind unabhängig. `version` ist der gemeinsame Default;
+`accept_version` und `send_version` überschreiben optional eine Richtung. Beim Empfang wird die
+konfigurierte Version sowie ein vollständiger gültiger Header innerhalb
+`header_timeout_seconds` erwartet. Fehlerhafte, übergroße, unvollständige Header, falsche
+Familien/Längen/Ports und nicht vertrauenswürdige Peers werden sauber geschlossen. Der v2-Parser
+begrenzt jede Nutzlast und validiert das TLV-Framing bei PROXY/UNSPEC; eine LOCAL-Nutzlast wird
+gemäß den Protokollregeln ignoriert. LOCAL/UNKNOWN liefert nie eine behauptete Client-IP.
+Geparste eingehende TLVs werden nicht in einen neu erzeugten ausgehenden Header kopiert.
+
+`accept = true` ist nur sicher, wenn der direkte TCP-Peer ein vertrauenswürdiger Proxy ist.
+Mindestens eine gültige IPv4-/IPv6-Adresse oder ein CIDR-Netz in `trusted_proxy_ips` ist zwingend.
+Eine leere Liste schlägt Fail-Closed fehl.
+
+`trust_all_proxies = true` ist ein ausdrücklich gefährlicher Notausgang. Jeder direkte Client kann
+damit eine beliebige Quelladresse fälschen; die Anwendung loggt eine CRITICAL-Warnung, die Option
+darf nicht mit einer Vertrauensliste kombiniert werden und darf niemals auf einem öffentlichen
+Listener verwendet werden. Beschränke den Listener zusätzlich per Firewall auf vertrauenswürdige
+Proxy-Peers. Aktiviere `send` nur, wenn jedes ausgewählte Backend die konfigurierte PROXY-Version
+erwartet.
+
+## Missbrauchsschutz und Logging
+
+Der Minecraft-Listener besitzt begrenzten Backlog, globales Sitzungsmaximum, optionales
+Per-Quell-IP-Limit und optionales Token-Bucket-Rate-Limit. Bei eingehendem PROXY Protocol wird der
+globale Platz vor dem Parsen reserviert. Per-IP-/Rate-Limits eines vertrauenswürdigen Proxys werden
+bis zum gültigen Header aufgeschoben und verwenden dann die behauptete Clientadresse (bei UNKNOWN
+den direkten Peer); ein nicht vertrauenswürdiger Peer wird unter seiner direkten Adresse erfasst
+und abgewiesen. Ein vertrauenswürdiger Edge-Proxy muss vom Client gelieferte Header daher
+bereinigen. Monitoring besitzt ein eigenes Verbindungslimit. Ablehnungsgründe verwenden in
+Metriken ein begrenztes Enum.
+
+Erwartete Disconnects und Network Resets werden nicht als interne Fehler geloggt. Unerwartete
+Fehler behalten Tracebacks. Externe Logwerte sind bereinigt und begrenzt;
+`logging.access_log` ist optional, weil verbindungsbezogene Logs großes Volumen erzeugen können.
 
 ## Docker
 
-Schnellstart:
+Das Image baut in einer Builder-Stufe ein Wheel und kopiert die installierte Umgebung in ein
+Python-Slim-Runtime-Image. Es läuft als UID/GID 10001, verwendet Exec-Entrypoint und SIGTERM,
+exponiert nur den Minecraft-Port und nutzt `--probe-live` als eingebauten Healthcheck. Die Probe
+verbindet sich im Container mit dem konfigurierten Monitoring-Listener und verlangt eine Antwort
+von `/live`; ein gestoppter oder hängender Eventloop wird deshalb unhealthy. Das Beispiel
+aktiviert Monitoring nur auf Container-Loopback, Compose veröffentlicht den Port nicht. Eigene
+Container-Konfigurationen müssen Monitoring ebenfalls für den Image-Healthcheck aktivieren. Ist
+ein Bearer-Token konfiguriert, liest die Probe es intern aus der gemounteten Konfiguration, ohne es
+auszugeben. Starte den Container unmittelbar nach Änderungen an der gemounteten Konfiguration neu:
+Der laufende Prozess behält seine Startkonfiguration, während jede Probe die aktuelle Datei liest.
+Bei sehr langen initialen Backend-Check-Timeouts muss die Health-Start-Gnadenfrist des
+Orchestrators entsprechend erhöht werden.
 
 ```bash
 cp config.example.toml config.toml
-nano config.toml
-docker compose up -d
+# Enthält die Datei ein Token, beschränke sie und erhalte Leserechte für Container-GID 10001.
+sudo chown root:10001 config.toml
+sudo chmod 0640 config.toml
+docker compose config
+docker compose up -d --build
 docker compose logs -f mc-failover
 ```
 
-Hinweise:
+Compose aktiviert Init-Prozess, Read-only-Root-Dateisystem, Drop aller Capabilities,
+`no-new-privileges`, begrenztes `/tmp`, PID-Limit und 60 Sekunden Stop-Grace. Nur `25565/tcp` wird
+veröffentlicht. Um Monitoring ausschließlich an Host-Loopback zu veröffentlichen, kommentiere das
+Mapping ein und konfiguriere im Container einen nichtlokalen Bind (`0.0.0.0`),
+`allow_remote = true` und ein Bearer-Token.
 
-- Port `25565/tcp` muss auf dem Host frei sein.
-- Wenn ein anderer Dienst bereits `25565` nutzt, ändere das Port-Mapping in `docker-compose.yml`.
-- MAIN und FALLBACK müssen aus dem Container erreichbar sein.
-- Auf Linux kannst du für Host-Zugriffe `host.docker.internal` via `host-gateway` aktivieren (Beispiel ist in `docker-compose.yml` auskommentiert enthalten).
+Das notwendige Volume ist der schreibgeschützte Bind von `/config/config.toml`. Erstelle für
+dateibasierte Wartung auf dem Host ein Verzeichnis `state/`, kommentiere den schreibgeschützten
+`/state`-Bind ein und konfiguriere `/state/force_fallback` sowie `/state/force_main`; der
+Host-Operator erstellt oder entfernt diese Marker. Ein dauerhaftes, von der Anwendung
+beschriebenes Volume ist nicht nötig. `/tmp` ist ein flüchtiges, begrenztes tmpfs.
 
-
-Wenn MAIN/FALLBACK auf demselben Linux-Host wie Docker laufen, aktiviere in `docker-compose.yml` das Host-Gateway-Mapping:
-
-```yaml
-extra_hosts:
-  - "host.docker.internal:host-gateway"
-```
-
-Verwende dann den Host in `config.toml` für die Upstreams:
-
-```toml
-[main]
-host = "host.docker.internal"
-port = 25564
-
-[fallback]
-host = "host.docker.internal"
-port = 25566
-```
+Container-Loopback ist nicht Host-Loopback. Laufen Backends direkt auf einem Linux-Docker-Host,
+aktiviere das auskommentierte `host.docker.internal:host-gateway`-Mapping und nutze diesen Hostnamen
+für die Ziele.
 
 ## systemd
 
-Für einen produktionsnahen systemd-Betrieb nutze:
+Nutze die [gehärtete Unit](packaging/systemd/mc-failover.service) und die
+[Installationsanleitung](packaging/systemd/README.md). Sie startet das Venv-Console-Script als
+`mcfailover`, validiert die Konfiguration per `ExecStartPre`, erzeugt Runtime-/State-Verzeichnisse,
+erlaubt nur Unix-/IPv4-/IPv6-Socketfamilien, setzt `LimitNOFILE=16384` und nutzt 60 Sekunden
+Stop-Timeout. Die Konfiguration bleibt root-kontrolliert und gruppenlesbar (`0640`), weil sie ein
+Token enthalten kann.
 
-- Service-Unit: `packaging/systemd/mc-failover.service`
-- Schritt-für-Schritt-Anleitung: `packaging/systemd/README.md`
-
-Kurzbefehle:
-
-```bash
-sudo systemctl enable --now mc-failover
-journalctl -u mc-failover -f
-```
-
-## Sicherheitshinweise
-
-- Der Proxy muss nicht als root laufen (Container und systemd-Service nutzen dedizierte unprivilegierte User-Defaults).
-- Lege die Laufzeit-Konfiguration außerhalb des Repos und außerhalb der Container-Image-Layer ab.
-- Öffne in der Firewall nur die notwendigen Ports.
-- Monitoring/Admin-Endpunkte nicht öffentlich exponieren, sofern nicht ausdrücklich erforderlich.
-
-## Firewall
+## Entwicklung und CI
 
 ```bash
-sudo ufw allow 25565/tcp
+python -m pip install -e ".[dev]"
+ruff check .
+ruff format --check .
+mypy src tests
+python -m compileall -q src tests mc_failover_proxy.py
+pytest --cov=mc_failover --cov-branch --cov-report=term-missing
+python -m build
 ```
 
-## Tests und Checks
+Die Release-Version wird ausschließlich als `project.version` in `pyproject.toml` gepflegt.
+Installierte Aufrufe lesen die Paketmetadaten; ein nicht installierter Source-Checkout liest
+denselben TOML-Wert und verwendet bei dessen Fehlen ausdrücklich `0+unknown`.
 
-```bash
-python3 -m unittest discover -s tests
-python3 -m py_compile mc_failover_proxy.py
-python3 -m compileall .
-```
+Die Coverage-Konfiguration aktiviert Branch Coverage und einen repositoryweiten Schwellwert von
+90 %. GitHub Actions ist für Ruff, mypy, Coverage, sdist-/Wheel-Build, isolierte Wheel-/CLI-
+Smoke-Checks, Dependency-Audit, Python-3.10-bis-3.14-Kompatibilität, Docker-Build und Compose-
+Validierung konfiguriert. Der Container-Job prüft zusätzlich, dass das Image healthy wird, bei
+angehaltenem Proxyprozess unhealthy wird, sich danach erholt und per SIGTERM sauber endet.
+Separate CodeQL- und Dependabot-Konfigurationen sind enthalten. Diese Aussagen beschreiben
+konfigurierte Prüfungen, nicht Ergebnisse eines bestimmten Rechners.
 
-## CLI-Checks für Admins (ohne Listener-Start)
+## Umfang und Sicherheitsgrenzen
 
-Diese Befehle laden/validieren die Config und führen gezielte Tests aus, **ohne** den produktiven Proxy-Listener zu starten. Praktisch vor `systemctl enable/start` sowie für VPS-, Tailscale-, Velocity- und HAProxy-Debugging.
+- Dies ist ein TCP-Failover-Router, kein Ersatz für Velocity/BungeeCord und kein System zur
+  Live-Migration bestehender Sitzungen.
+- Er verschlüsselt Traffic nicht und authentifiziert keine Minecraft-Clients; nutze passende
+  Netzwerkkontrollen.
+- Veröffentliche nur den Minecraft-Listener. Monitoring bleibt lokal oder authentifiziert.
+- Starte den Dienst nicht als root; Port 25565 benötigt das unter Linux nicht.
+- Sind beide Ziele nicht verfügbar, werden neue Clients geschlossen, statt zu einem bekanntermaßen
+  defekten Ziel gesendet.
+- Python kann DNS-/NSS- und Wartungsdatei-Awaits zeitlich begrenzen, einen bereits im
+  Betriebssystem blockierten Resolver- oder Netzwerkdateisystem-Workerthread aber nicht gewaltsam
+  beenden. Nutze zuverlässige lokale NSS-/Resolver-Konfiguration und lokale Wartungspfade; die
+  Stop-Deadline des Service-Managers bleibt die letzte betriebliche Grenze.
 
-```bash
-python3 mc_failover_proxy.py --config config.toml --check-config
-python3 mc_failover_proxy.py --config config.toml --print-effective-config
-python3 mc_failover_proxy.py --config config.toml --test-main
-python3 mc_failover_proxy.py --config config.toml --test-fallback
-python3 mc_failover_proxy.py --config config.toml --test-healthcheck
-```
-
-- `--test-main` prüft das reine TCP-Routing-Ziel von MAIN.
-- `--test-fallback` prüft das reine TCP-Routing-Ziel von FALLBACK.
-- `--test-healthcheck` prüft genau die konfigurierte Healthcheck-Entscheidung (`tcp` oder `minecraft_status`).
-- Wenn `--test-main` erfolgreich ist, aber `--test-healthcheck` fehlschlägt, ist meistens Minecraft-Status-Ping (`enable-status`), `status_hostname` oder `protocol_version` die Ursache.
-
-## Fehlersuche (Troubleshooting)
-
-- `config.toml` nicht gefunden:
-  - `WorkingDirectory` und `--config`-Pfad prüfen.
-  - Explizit starten: `python3 mc_failover_proxy.py --config config.toml`
-- Ungültiges TOML:
-  - TOML-Syntax (Sections, Quotes, Key/Value-Format) korrigieren.
-- Falsche Typen in der Config:
-  - Ports müssen Integer sein, Timeout/Intervall numerisch.
-- Proxy-Schleife erkannt:
-  - MAIN/FALLBACK dürfen nicht auf denselben Listener-Host+Port zeigen.
-- Port bereits belegt:
-  - Prüfen mit: `ss -ltnp | grep 25565`
-- MAIN nicht erreichbar:
-  - Routing, Firewall, DNS vom Proxy-Host aus kontrollieren.
-- FALLBACK nicht erreichbar:
-  - Erreichbarkeit des Fallback-Servers gezielt testen.
-- Python 3.10 ohne `tomli`:
-  - `python3 -m pip install -r requirements.txt`
-- systemd findet Config nicht:
-  - Absoluten `--config`-Pfad + passendes `WorkingDirectory` setzen.
-- Spieler verbinden sich auf falschen Port:
-  - DNS/SRV-Einträge und Client-Ziel auf Proxy-Port prüfen.
-- Velocity/HAProxy nutzt bereits Port 25565:
-  - Einen Dienst auf anderen Port verschieben oder Kette sauber neu planen.
-- Tailscale-/WireGuard-Routing-Probleme:
-  - Routen, ACLs und Freigaben zwischen Netzen/Hosts prüfen.
-- Konfigurationsfehler auf stderr:
-  - Aktuell gibt das Programm bei Config-Problemen `Konfigurationsfehler: ...` auf stderr aus und beendet sich mit Exit-Code `1`.
-
-## Grenzen des Projekts
-
-- Kein vollwertiger Minecraft-Proxy wie Velocity.
-- Keine Live-Migration bereits verbundener Spieler.
-- Kein Login-/Packet-Rewrite.
-- Kein Load-Balancer für mehrere Hauptserver.
-- Der Healthcheck beeinflusst nur neue Verbindungen.
-
-## Sicherheit
-
-- Nicht unnötig als root ausführen.
-- Firewall möglichst restriktiv halten.
-- Nur notwendige Interfaces binden.
-- `config.toml` enthält bewusst keine Secrets.
-- Für Port `25565` ist root i. d. R. nicht nötig (Port > 1024).
-
-## Beispiel-Setups
-
-1. **MAIN und FALLBACK lokal auf demselben Host**
-   - MAIN: `127.0.0.1:25567`
-   - FALLBACK: `127.0.0.1:25566`
-   - Proxy: `0.0.0.0:25565`
-
-2. **MAIN über Tailscale/VPN, FALLBACK lokal**
-   - MAIN auf privater VPN-IP/Hostname
-   - FALLBACK als lokale Lobby/Warteraum
-   - Sinnvoll, wenn der primäre Server extern betrieben wird.
-
-3. **Proxy auf VPS, MAIN zuhause via Tailscale**
-   - Öffentlicher Einstiegspunkt auf VPS
-   - MAIN-Server zuhause über Tailscale erreichbar
-   - FALLBACK auf VPS oder anderem erreichbaren Host.
-
-## Monitoring
-
-Optional ist ein eingebauter HTTP-Monitoring-Port verfügbar (standardmäßig deaktiviert).
-
-- Standard-Bind ist nur localhost (`127.0.0.1`).
-- Der Endpoint sollte privat bleiben, da er interne Routing-/Health-Daten zeigt.
-
-```bash
-curl http://127.0.0.1:8080/health
-curl http://127.0.0.1:8080/ready
-curl http://127.0.0.1:8080/state
-curl http://127.0.0.1:8080/metrics
-```
-
-Für Uptime Kuma nutze `/health` oder `/ready`, für Prometheus `/metrics`.
-Monitoring-Port nicht direkt öffentlich ins Internet öffnen. Besser über Tailscale, WireGuard, SSH-Tunnel oder Reverse Proxy mit Auth.
-
-`/state`, `/health` und `/ready` zeigen immer die **aktuell neu berechnete** Routing-Entscheidung.  
-Dateibasierte Wartungs-Overrides werden im Monitoring sofort sichtbar (ohne Neustart und ohne neue Spieler-Verbindung).
-
-```bash
-touch /var/lib/mc-failover/force_fallback
-curl http://127.0.0.1:8080/state
-```
-
-Danach sollte in der Antwort `active_target="FALLBACK"` und `routing_reason="force_fallback_file"` stehen.
-
-Wenn du auf einem VPS arbeitest, lasse `listen_host` am besten auf `127.0.0.1` und greife per SSH-Tunnel oder Tailscale darauf zu.
-
-
-## PROXY-Protokoll
-
-Dieser Proxy unterstützt **PROXY protocol v1 und v2**. Optional kann er PROXY-Header von einem vertrauenswürdigen Downstream-Proxy annehmen und/oder an Upstream-Server weitergeben.
-
-⚠️ Sicherheitswarnung: `accept=true` niemals für untrusted Internet-Clients aktivieren. Zugriff einschränken und `trusted_proxy_ips` setzen.
-Wenn `trusted_proxy_ips = []`, gilt jeder direkte Peer als vertrauenswürdig für PROXY-Header.
-Das ist nur sicher bei nicht-öffentlichen Listenern (z. B. `127.0.0.1` oder private Tailscale/VPN-IP).
-`accept_version` und `send_version` sind optionale Overrides und überschreiben `version`.
-Setze sie nur, wenn du absichtlich unterschiedliche Versionen pro Richtung willst.
-
-Beispiel 1 (nur akzeptieren):
-```toml
-[proxy_protocol]
-accept = true
-send = false
-version = 1
-trusted_proxy_ips = ["100.64.0.1", "127.0.0.1"]
-```
-
-Beispiel 2 (akzeptieren + an Velocity weitergeben):
-```toml
-[proxy_protocol]
-accept = true
-send = true
-version = 1
-trusted_proxy_ips = ["100.64.0.1"]
-```
-
-Beispiel 3 (v2 akzeptieren, v1 senden):
-```toml
-[proxy_protocol]
-accept = true
-send = true
-version = 2
-accept_version = 2
-send_version = 1
-trusted_proxy_ips = ["100.64.0.1"]
-```
-
-Prüfe die Velocity-Dokumentation für die passende Listener-/PROXY-protocol-Einstellung.
-
-HAProxy-Backend-Beispiele:
-```haproxy
-backend mc_failover
-    mode tcp
-    server failover 100.64.0.20:25565 send-proxy
-    # oder:
-    # server failover 100.64.0.20:25565 send-proxy-v2
-```
-Wenn `send=true` aktiv ist, muss dein Backend die konfigurierte PROXY-Version ebenfalls unterstützen.
-
----
-
-[English](README.md)
+Lizenziert unter der [MIT-Lizenz](LICENSE).

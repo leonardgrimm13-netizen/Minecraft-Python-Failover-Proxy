@@ -1,114 +1,161 @@
-# Minecraft Python Failover Proxy example configuration
+# Complete configuration for Minecraft Python Failover Proxy.
+# Copy this file to config.toml, edit MAIN/FALLBACK, then run:
+#   mc-failover --config config.toml --check-config
+
+[config]
+# Reject unknown sections and keys. Keep this enabled so spelling mistakes fail fast.
+strict_unknown_keys = true
 
 [proxy]
+# Public Minecraft listener. Use "::" for an IPv6 wildcard listener.
 listen_host = "0.0.0.0"
 listen_port = 25565
+# Kernel accept queue, before application-level connection limits are applied.
+backlog = 256
 
 [main]
-# Route target for players when MAIN is healthy.
-# Example: local Velocity instance behind the failover proxy.
-# IMPORTANT: Velocity must NOT listen on the same host+port as the failover proxy.
+# A target sharing a listener port is DNS-resolved and checked fail-closed against
+# every actually bound local address before healthchecks or player routing.
 host = "127.0.0.1"
 port = 25564
 
 [fallback]
-# Fallback / waiting room server.
 host = "127.0.0.1"
 port = 25566
 
 [healthcheck]
-# Healthcheck mode:
-# - "tcp": simple TCP reachability check against MAIN/main target.
-# - "minecraft_status": real Minecraft status ping.
-#
-# For a first start, "tcp" is the safest default.
-# For Velocity setups, use "minecraft_status" and set target_host/target_port below.
+# MAIN check. "tcp" proves that a TCP connection can be opened.
+# "minecraft_status" additionally validates a Minecraft status response.
+enabled = true
 mode = "tcp"
-
-# Optional healthcheck override.
-# If unset, main.host/main.port are checked.
-# Useful when main points to Velocity but health should come from the real backend.
-# Example:
-# target_host = "100.64.0.10"
-# target_port = 25567
-
-# Minecraft status handshake protocol version (default: 767).
-# Used only for mode = "minecraft_status".
+interval_seconds = 3.0
+# One absolute deadline covers DNS/connect/write/read for each check.
+timeout_seconds = 2.0
+fail_after = 2
+recover_after = 2
+min_recovery_seconds = 0.0
+# Empty target_host and an omitted target_port use [main].
+target_host = ""
+# target_port = 25564
 protocol_version = 767
-# status_hostname = "survival.example.com"
-
-# true: require and parse valid JSON status response.
-# false: accept valid status packet id 0x00 without JSON parsing.
+# Empty status_hostname uses the effective healthcheck host.
+status_hostname = ""
 require_valid_json = true
-
-# true: log successful status details (version/players/latency).
-# Can be noisy with low interval_seconds.
+# Paper may report protocol = -1 while startup is incomplete. Keep this true
+# so such a structurally valid response is not considered ready.
+reject_uninitialized_protocol = true
 log_status_details = false
-# Optional minecraft_status readiness filters.
-# 0 or empty values disable the filter.
-# Text filters are case-sensitive.
-# JSON-based filters require require_valid_json = true.
-# max_latency_ms also works without JSON parsing.
+jitter_seconds = 0.0
+# Zero/empty filters disable the corresponding minecraft_status constraint.
 max_latency_ms = 0.0
 expected_version_contains = ""
 motd_must_contain = ""
 motd_must_not_contain = ""
 min_players_max = 0
 
+[fallback_healthcheck]
+# FALLBACK is monitored independently with its own counters and hysteresis.
+# When disabled, FALLBACK remains optimistically routable but health is unknown;
+# monitoring therefore reports a degraded state whenever it is selected.
+enabled = true
+mode = "tcp"
 interval_seconds = 3.0
 timeout_seconds = 2.0
 fail_after = 2
 recover_after = 2
-
-# Additional stable recovery time before switching from FALLBACK back to MAIN.
-# Useful for Minecraft servers that answer status pings before plugins/worlds are fully ready.
 min_recovery_seconds = 0.0
-jitter_seconds = 0.2
+target_host = ""
+# target_port = 25566
+protocol_version = 767
+status_hostname = ""
+require_valid_json = true
+reject_uninitialized_protocol = true
+log_status_details = false
+jitter_seconds = 0.0
+max_latency_ms = 0.0
+expected_version_contains = ""
+motd_must_contain = ""
+motd_must_not_contain = ""
+min_players_max = 0
 
 [connection]
+# Upstream connection deadline and bounded relay buffer.
 timeout_seconds = 5.0
 buffer_size = 65536
+# Zero disables the established-session idle timeout.
 idle_timeout_seconds = 300.0
-connect_fallback_on_main_connect_failure = true
-tcp_keepalive = true
+write_timeout_seconds = 30.0
+# After one clean TCP half-close, allow the opposite direction to finish for this long.
+relay_drain_timeout_seconds = 10.0
+# SIGTERM/SIGINT: drain sessions, then cancel them, then bound writer cleanup.
+shutdown_grace_seconds = 30.0
+shutdown_cancel_timeout_seconds = 5.0
+# If true, an actual failed MAIN connect may immediately try healthy FALLBACK in auto mode.
+connect_fallback_on_main_connect_failure = false
+tcp_keepalive = false
+# Global concurrent Minecraft sessions.
 max_connections = 4096
+# Zero disables the per-source-IP limit. Must not exceed max_connections.
+max_connections_per_ip = 0
+# Lightweight token bucket for new connections; both values must be zero or both positive.
+new_connections_per_second = 0.0
+new_connections_burst = 0
 
 [maintenance]
-# "auto" = healthcheck decides routing.
-# "force_fallback" = always route new players to fallback/waiting room.
-# "force_main" = always route new players to main (even if healthcheck is unhealthy).
+# auto, force_main, or force_fallback.
 mode = "auto"
-
-# Optional file-based override (checked dynamically, no restart needed):
-# if this file exists, force_fallback is active.
-# Ideal for maintenance windows.
+# Relative paths are resolved against the directory containing this TOML file.
+# Empty values disable file overrides. force_fallback_file wins if both files exist.
 force_fallback_file = ""
-
-# Optional file-based override (checked dynamically, no restart needed):
-# if this file exists, force_main is active.
-# force_fallback_file has priority when both files exist.
 force_main_file = ""
+file_check_interval_seconds = 1.0
+
+[circuit_breaker]
+# Passive failures are failed real MAIN connection attempts, not active checks.
+enabled = true
+failure_threshold = 3
+failure_window_seconds = 10.0
+open_seconds = 15.0
+half_open_max_attempts = 1
+
+[proxy_protocol]
+# Inbound PROXY v1/v2 is disabled by default. When accept=true, fail-closed
+# validation requires at least one trusted IPv4/IPv6/CIDR peer below.
+accept = false
+# Outbound header; enable only when the selected backend expects it.
+send = false
+version = 1
+# Optional direction-specific overrides (1 or 2):
+# accept_version = 2
+# send_version = 2
+
+# DANGEROUS: true lets every direct peer assert an arbitrary source address.
+# Never use it on an Internet-facing listener. It cannot be combined with trusted_proxy_ips.
+trust_all_proxies = false
+trusted_proxy_ips = []
+# Absolute inbound header deadline and total header/TLV size bound.
+header_timeout_seconds = 2.0
+max_header_bytes = 4096
 
 [monitoring]
-# Optional local HTTP monitoring endpoint (disabled by default).
-enabled = false
+# Enabled only on container/host loopback so Docker can probe the running event loop.
+# Set enabled=false if monitoring and the image HEALTHCHECK are both intentionally unused.
+enabled = true
 listen_host = "127.0.0.1"
 listen_port = 8080
+# A non-loopback bind requires allow_remote=true and either bearer_token or the
+# explicit dangerous allow_unauthenticated_remote=true opt-in.
 allow_remote = false
+bearer_token = ""
+allow_unauthenticated_remote = false
+# /state normally omits configured target hosts/ports.
+expose_sensitive_state = false
+max_connections = 128
+# Absolute request deadline and bounded response write deadline.
+request_timeout_seconds = 2.0
+write_timeout_seconds = 2.0
 
 [logging]
 level = "INFO"
-[proxy_protocol]
-# WARNING: Enable only if you know what you are doing.
-# accept=true should only be used behind trusted HAProxy/reverse proxies.
-# Always set trusted_proxy_ips when accept=true.
-# send=true only if the upstream server expects PROXY protocol.
-# version: compatibility default for accept/send (1 or 2).
-# accept_version/send_version override version per direction (optional).
-# Only set accept_version/send_version if you intentionally want different versions per direction.
-accept = false
-send = false
-version = 1
-# accept_version = 2
-# send_version = 2
-trusted_proxy_ips = []
+# Logs bounded peer/target/reason connection events; disabled to avoid routine log volume.
+access_log = false

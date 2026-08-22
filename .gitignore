@@ -1,18 +1,58 @@
+# Local configuration and secrets
+config.toml
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+id_rsa
+id_ed25519
+
+# Python bytecode and environments
 __pycache__/
 *.py[cod]
+*$py.class
+.python-version
 .venv/
+.wheel-venv/
 venv/
 env/
-.env
-.idea/
-.vscode/
-dist/
+
+# Packaging
 build/
+dist/
+site/
 *.egg-info/
+pip-wheel-metadata/
+wheelhouse/
+
+# Tests, coverage, and type/lint caches
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+junit*.xml
+.hypothesis/
 .pytest_cache/
 .mypy_cache/
+.dmypy.json
+dmypy.json
+.pyright/
 .ruff_cache/
-.coverage
-htmlcov/
+.tox/
+.nox/
+
+# Editors and operating systems
+.agents/
+.codex/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
 .DS_Store
+Thumbs.db
+
+# Runtime output
 *.log
+*.pid

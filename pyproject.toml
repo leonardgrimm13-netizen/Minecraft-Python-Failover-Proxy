@@ -1,11 +1,190 @@
-[tool.black]
-line-length = 100
-target-version = ["py310"]
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "minecraft-failover-proxy"
+version = "1.0.0"
+description = "A secure, asynchronous TCP failover proxy for Minecraft servers"
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Leonard Grimm" }]
+keywords = ["asyncio", "failover", "minecraft", "proxy", "tcp"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Environment :: Console",
+  "Intended Audience :: System Administrators",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Internet :: Proxy Servers",
+  "Topic :: System :: Networking",
+]
+dependencies = [
+  "tomli>=2.0.1; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2.2,<2",
+  "mypy>=1.14,<2",
+  "pip-audit>=2.7,<3",
+  "pytest>=8.3,<10",
+  "pytest-asyncio>=0.25,<2",
+  "pytest-cov>=6,<8",
+  "pytest-timeout>=2.3,<3",
+  "ruff>=0.9,<1",
+]
+
+[project.scripts]
+mc-failover = "mc_failover.cli:main"
+
+[project.urls]
+Documentation = "https://github.com/leonardgrimm13-netizen/Minecraft-Python-Failover-Proxy#readme"
+Issues = "https://github.com/leonardgrimm13-netizen/Minecraft-Python-Failover-Proxy/issues"
+Source = "https://github.com/leonardgrimm13-netizen/Minecraft-Python-Failover-Proxy"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mc_failover"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src",
+  "/tests",
+  "/packaging",
+  "/mc_failover_proxy.py",
+  "/config.example.toml",
+  "/.dockerignore",
+  "/Dockerfile",
+  "/docker-compose.yml",
+  "/LICENSE",
+  "/README.md",
+  "/README.de.md",
+  "/pyproject.toml",
+  "/requirements.txt",
+  "/requirements-dev.txt",
+  "/tools/check_release_archives.py",
+]
 
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "ASYNC",
+  "B",
+  "C4",
+  "DTZ",
+  "E4",
+  "E7",
+  "E9",
+  "F",
+  "I",
+  "LOG",
+  "N",
+  "PIE",
+  "RUF",
+  "S",
+  "UP",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"src/mc_failover/proxy_protocol.py" = [
+  "S104", # Unspecified addresses represent LOCAL/UNKNOWN peers, not listeners.
+]
+"tests/*.py" = [
+  "S101", # Assertions are the test API.
+  "S104", # Wildcard addresses are validation fixtures, not listeners.
+  "S105", # Test fixtures may intentionally resemble passwords/tokens.
+  "S106",
+  "S311", # Deterministic pseudo-random test data is not cryptographic.
+]
+"tests/**/*.py" = [
+  "S101", # Assertions are the test API.
+  "S105", # Test fixtures may intentionally resemble passwords/tokens.
+  "S106",
+  "S311", # Deterministic pseudo-random test data is not cryptographic.
+]
+[tool.ruff.lint.isort]
+known-first-party = ["mc_failover"]
+
+[tool.ruff.format]
+docstring-code-format = true
+indent-style = "space"
+line-ending = "lf"
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.10"
+mypy_path = "src"
+strict = true
+explicit_package_bases = true
+pretty = true
+show_error_codes = true
+show_error_context = true
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = ["tests.*", "unit.*"]
+check_untyped_defs = true
+disallow_incomplete_defs = false
+disallow_untyped_calls = false
+disallow_untyped_defs = false
+disallow_untyped_decorators = false
+warn_return_any = false
 
 [tool.pytest.ini_options]
-pythonpath = ["."]
+addopts = [
+  "--strict-config",
+  "--strict-markers",
+  "-ra",
+]
+asyncio_mode = "auto"
+asyncio_debug = true
+asyncio_default_fixture_loop_scope = "function"
+faulthandler_timeout = 20
+filterwarnings = [
+  "error::ResourceWarning",
+  "error::RuntimeWarning",
+  "default::DeprecationWarning",
+]
+pythonpath = ["src", "."]
 testpaths = ["tests"]
+timeout = 20
+timeout_method = "thread"
+xfail_strict = true
+
+[tool.coverage.run]
+branch = true
+parallel = true
+source = ["src/mc_failover"]
+
+[tool.coverage.paths]
+source = [
+  "src/mc_failover",
+  "*/site-packages/mc_failover",
+]
+
+[tool.coverage.report]
+exclude_also = [
+  "if TYPE_CHECKING:",
+  "if __name__ == .__main__.:",
+  "raise NotImplementedError",
+  '\.\.\.',
+]
+fail_under = 90
+precision = 1
+show_missing = true
+skip_empty = true
+
+[tool.coverage.xml]
+output = "coverage.xml"
