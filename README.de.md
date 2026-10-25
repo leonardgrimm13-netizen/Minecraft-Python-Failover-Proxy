@@ -51,6 +51,10 @@ der Operator die automatische Richtlinie überschreibt.
 Ein statischer Wartungsmodus hat Vorrang vor Dateien. In `auto` werden die Dateien außerhalb des
 Verbindungs-Hot-Paths abgefragt; `force_fallback_file` gewinnt, wenn beide Dateien existieren.
 
+Bei Zugriffs- oder I/O-Fehlern einer Wartungsdatei bleibt die zuletzt bekannte Richtlinie
+erhalten; der Fehler wird protokolliert. Eine erzwungene Richtlinie wird dadurch nicht still
+aufgehoben.
+
 ### Aktive Healthchecks
 
 - `tcp` öffnet und schließt eine TCP-Verbindung. Das beweist, dass ein Listener eine Verbindung
@@ -383,8 +387,8 @@ Token enthalten kann.
 python -m pip install -e ".[dev]"
 ruff check .
 ruff format --check .
-mypy src tests
-python -m compileall -q src tests mc_failover_proxy.py
+mypy src tests tools
+python -m compileall -q src tests tools mc_failover_proxy.py
 pytest --cov=mc_failover --cov-branch --cov-report=term-missing
 python -m build
 ```
@@ -400,6 +404,29 @@ Validierung konfiguriert. Der Container-Job prüft zusätzlich, dass das Image h
 angehaltenem Proxyprozess unhealthy wird, sich danach erholt und per SIGTERM sauber endet.
 Separate CodeQL- und Dependabot-Konfigurationen sind enthalten. Diese Aussagen beschreiben
 konfigurierte Prüfungen, nicht Ergebnisse eines bestimmten Rechners.
+
+## Lokaler Audit und Benchmarks
+
+Der [technische Audit vom 25.10.2026](docs/AUDIT-2026-10-25.md) dokumentiert Korrekturen,
+Regressionstests, Python-Kompatibilitätsprüfungen, Messwerte und Verifikationsgrenzen.
+Die Rohmessungen liegen beim Bericht.
+
+```bash
+python tools/benchmark_proxy.py --output /tmp/proxy-benchmark.json
+```
+
+Das begrenzte Linux-Loopback-Werkzeug erzeugt eigene Backends und temporäre Listener; es sendet
+keine Last an konfigurierte Produktionsziele. Geprüft werden Byte-Transparenz, Roundtrip-Latenz
+kleiner Pakete, große Übertragungen, Verbindungswechsel, langsame Empfänger, abrupte Abbrüche,
+Failover/Recovery und Shutdown. Standard sind 32 gleichzeitige Clients und 1000 Verbindungszyklen.
+CPU/RSS enthalten Werkzeug und Backends; RTT umfasst den gesamten Datenweg. Dies sind
+Vergleichsmessungen, keine Kapazitätsaussagen oder isolierte Proxy-Latenzen. Wiederholungen in
+frischen Prozessen auf demselben unbelasteten Rechner vergleichen.
+
+Das globale Verbindungslimit begrenzt auch beim Accept eingereihte Handler und noch aufräumende
+Sitzungen. Abgebrochene Healthcheck-Cleanups brechen blockierte Transporte ab. Leere
+Transport-Schreibpuffer vermeiden redundante zeitbegrenzte Drains; gepufferte Schreibvorgänge
+behalten Backpressure und Schreibdeadlines.
 
 ## Umfang und Sicherheitsgrenzen
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import math
+import sys
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -106,15 +106,13 @@ class CircuitBreaker:
         if (
             isinstance(failure_window_seconds, bool)
             or not isinstance(failure_window_seconds, (int, float))
-            or not math.isfinite(failure_window_seconds)
-            or failure_window_seconds <= 0
+            or not 0 < failure_window_seconds <= sys.float_info.max
         ):
             raise ValueError("failure_window_seconds must be > 0")
         if (
             isinstance(open_seconds, bool)
             or not isinstance(open_seconds, (int, float))
-            or not math.isfinite(open_seconds)
-            or open_seconds <= 0
+            or not 0 < open_seconds <= sys.float_info.max
         ):
             raise ValueError("open_seconds must be > 0")
         if (

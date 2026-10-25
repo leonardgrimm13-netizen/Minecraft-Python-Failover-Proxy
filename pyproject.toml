@@ -71,6 +71,8 @@ include = [
   "/requirements.txt",
   "/requirements-dev.txt",
   "/tools/check_release_archives.py",
+  "/tools/benchmark_proxy.py",
+  "/docs",
 ]
 
 [tool.ruff]

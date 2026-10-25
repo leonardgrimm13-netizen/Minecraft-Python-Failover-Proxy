@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,11 +47,20 @@ class MaintenanceWatcher:
         fallback_file = self.config.force_fallback_file
         main_file = self.config.force_main_file
 
+        def flag_exists(path: Path | None) -> bool:
+            if path is None:
+                return False
+            try:
+                return stat.S_ISREG(path.stat().st_mode)
+            except (FileNotFoundError, NotADirectoryError):
+                return False
+
         def check_files() -> tuple[bool, bool]:
-            return (
-                fallback_file is not None and Path(fallback_file).is_file(),
-                main_file is not None and Path(main_file).is_file(),
-            )
+            # Preserve cached policy on access/I/O errors, including Python
+            # 3.14 where Path.is_file() silently suppresses those errors.
+            if flag_exists(fallback_file):
+                return True, False
+            return False, flag_exists(main_file)
 
         fallback_exists, main_exists = await asyncio.to_thread(check_files)
         if fallback_exists:

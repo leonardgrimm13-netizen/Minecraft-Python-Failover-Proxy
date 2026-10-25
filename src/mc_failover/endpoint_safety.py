@@ -58,13 +58,21 @@ def _scoped_address(value: str, scope_id: int = 0) -> str | None:
     if isinstance(scope_id, bool) or not 0 <= scope_id <= _MAX_SCOPE_ID:
         return None
     if scope_id > 0:
-        return f"{normalized}%{scope_id}"
+        return (
+            f"{normalized}%{scope_id}" if _address_object(normalized).is_link_local else normalized
+        )
     if not separator:
         return normalized
     canonical_scope = _canonical_scope_id(textual_scope)
     if canonical_scope is None:
         return None
-    return f"{normalized}%{canonical_scope}"
+    # A loopback/global address retains its identity when the kernel ignores
+    # an irrelevant zone. Only link-local addresses need interface identity.
+    return (
+        f"{normalized}%{canonical_scope}"
+        if _address_object(normalized).is_link_local
+        else normalized
+    )
 
 
 def _address_object(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
@@ -230,6 +238,10 @@ class EndpointLoopGuard:
             raise EndpointLoopError(
                 f"endpoint {host}:{port} could not be resolved for listener-loop validation"
             )
+        # Some kernels connect unspecified destinations to loopback. DNS can
+        # return them even though literal wildcard targets fail config checks.
+        if any(_address_object(value).is_unspecified for value in target_addresses):
+            raise EndpointLoopError(f"endpoint {host}:{port} resolves to an unspecified address")
         for listener in matching:
             listener_addresses = await self._listener_values(listener)
             if not listener_addresses:

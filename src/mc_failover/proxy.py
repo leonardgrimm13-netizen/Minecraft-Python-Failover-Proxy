@@ -74,9 +74,23 @@ class ProxyServer:
             self.runtime.reject(RejectionReason.SHUTTING_DOWN)
             writer.close()
             return
+        # Bound queued handlers and their cleanup too, before any coroutine
+        # has a chance to acquire a limiter lease. Rejecting in the handler
+        # alone permits an unbounded backlog of rejection/close tasks.
+        if self.tasks.active_count >= self.config.connection.max_connections:
+            self.runtime.reject(RejectionReason.GLOBAL_LIMIT)
+            writer.close()
+            return
         self._writers.add(writer)
+
+        def finished(_task: asyncio.Task[None]) -> None:
+            # Canceled-before-start coroutines never enter handle_client's finally.
+            writer.close()
+            self._writers.discard(writer)
+
         try:
-            self.tasks.create(self.handle_client(reader, writer))
+            task = self.tasks.create(self.handle_client(reader, writer))
+            task.add_done_callback(finished)
         except RuntimeError:
             self._writers.discard(writer)
             self.runtime.reject(RejectionReason.SHUTTING_DOWN)
