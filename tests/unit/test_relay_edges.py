@@ -19,6 +19,9 @@ class FakeTransport:
     def abort(self) -> None:
         self.aborted = True
 
+    def get_write_buffer_size(self) -> int:
+        return 1
+
 
 class FakeSocket:
     def __init__(self, *, fail: bool = False) -> None:
@@ -508,3 +511,33 @@ async def test_relay_outer_cancellation_and_unexpected_task_error_collect_all_ta
             clock=FakeClock(),
         )
     assert peer_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_pipe_avoids_timed_drain_when_transport_has_no_buffered_bytes() -> None:
+    class EmptyTransport(FakeTransport):
+        def get_write_buffer_size(self) -> int:
+            return 0
+
+    class ReadyWriter(FakeWriter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.transport = EmptyTransport()
+            self.drains = 0
+
+        async def drain(self) -> None:
+            self.drains += 1
+
+    writer = ReadyWriter()
+    result = await relay.pipe(
+        stream_reader(ScriptedReader(b"abc", b"def", b"")),
+        stream_writer(writer),
+        direction="ready",
+        buffer_size=4,
+        idle_timeout_seconds=0.0,
+        write_timeout_seconds=0.2,
+        activity=activity(),
+    )
+    assert result == PipeResult("ready", PipeEnd.EOF, 6)
+    assert writer.writes == [b"abc", b"def"]
+    assert writer.drains == 1  # EOF still flushes and checks writer errors.

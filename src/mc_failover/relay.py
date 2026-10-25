@@ -150,10 +150,15 @@ async def pipe(
         activity.touch()
         try:
             destination.write(data)
-            if write_timeout_seconds > 0:
-                await asyncio.wait_for(destination.drain(), timeout=write_timeout_seconds)
-            else:
-                await destination.drain()
+            # A zero transport buffer means write() handed everything to the
+            # kernel. Avoid allocating a timeout for a drain that cannot block.
+            # Buffered writes retain normal backpressure and the same deadline;
+            # closing writers and EOF still go through drain's error checks.
+            if destination.transport.get_write_buffer_size() or destination.is_closing():
+                if write_timeout_seconds > 0:
+                    await asyncio.wait_for(destination.drain(), timeout=write_timeout_seconds)
+                else:
+                    await destination.drain()
         except asyncio.CancelledError:
             raise
         except (asyncio.TimeoutError, ConnectionResetError, BrokenPipeError, OSError) as exc:

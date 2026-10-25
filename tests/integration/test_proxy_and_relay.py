@@ -349,3 +349,42 @@ async def test_connection_limit_and_cancel_during_active_transfer() -> None:
         assert harness.runtime.active_connections == 0
         assert harness.limiter.active == 0
         assert harness.proxy.tasks.active_count == 0
+
+
+@pytest.mark.asyncio
+async def test_backend_backpressure_hits_write_deadline_and_releases_session() -> None:
+    release_backend = asyncio.Event()
+    backend_done = asyncio.Event()
+
+    async def stalled(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            await release_backend.wait()
+        finally:
+            await close_writer(writer)
+            backend_done.set()
+
+    async with running_server(stalled) as backend:
+        config = make_config(server_port(backend), server_port(backend))
+        config = replace(config, connection=replace(config.connection, write_timeout_seconds=0.02))
+        harness = ProxyHarness(config)
+        proxy_port = await harness.start()
+        reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
+        # Larger than the local socket windows and both StreamReader buffers.
+        writer.write(b"x" * (8 * 2**20))
+        sending = asyncio.create_task(writer.drain())
+        try:
+            try:
+                assert await asyncio.wait_for(reader.read(), 3.0) == b""
+            except ConnectionResetError:
+                pass
+            await harness.stop()
+            assert harness.limiter.active == 0
+            assert harness.runtime.active_connections == 0
+            assert harness.proxy.tasks.active_count == 0
+        finally:
+            sending.cancel()
+            await asyncio.gather(sending, return_exceptions=True)
+            await close_writer(writer)
+            release_backend.set()
+            await asyncio.wait_for(backend_done.wait(), 1.0)
+            await harness.stop()
