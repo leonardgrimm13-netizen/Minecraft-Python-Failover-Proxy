@@ -46,7 +46,8 @@ controlled half-open probe after the circuit's open interval. A usable forced ta
 reported as degraded because the operator is overriding automatic policy.
 
 Static maintenance mode has priority over files. In `auto`, the files are polled outside the
-connection path; `force_fallback_file` wins if both files exist.
+connection path; `force_fallback_file` wins if both files exist. An unreadable flag retains the
+last known policy and logs an error instead of silently clearing a forced mode.
 
 ### Active healthchecks
 
@@ -357,8 +358,8 @@ token.
 python -m pip install -e ".[dev]"
 ruff check .
 ruff format --check .
-mypy src tests
-python -m compileall -q src tests mc_failover_proxy.py
+mypy src tests tools
+python -m compileall -q src tests tools mc_failover_proxy.py
 pytest --cov=mc_failover --cov-branch --cov-report=term-missing
 python -m build
 ```
@@ -374,6 +375,27 @@ CodeQL and Dependabot configurations are included. The container job also verifi
 becomes healthy, becomes unhealthy while the proxy process is suspended, recovers afterward, and
 exits cleanly on SIGTERM. These statements describe configured checks, not results from a
 particular machine.
+
+## Local audit and benchmarks
+
+The [2026-10-25 technical audit](docs/AUDIT-2026-10-25.md) records fixes, regression tests,
+Python compatibility checks, measured results, and verification limits. Raw measurements are
+included alongside the report.
+
+```bash
+python tools/benchmark_proxy.py --output /tmp/proxy-benchmark.json
+```
+
+This bounded Linux loopback harness creates its own backends and temporary listeners; it sends no
+traffic to configured production targets. It checks byte transparency, small-packet RTT, bulk
+transfer, connection churn, slow receivers, abrupt disconnects, failover/recovery, and shutdown.
+Defaults are 32 concurrent clients and 1000 connection cycles. CPU/RSS include the harness and
+backends, and RTT is end-to-end; these are comparative measurements, not production capacity or
+isolated proxy latency. Use fresh processes and compare repeated runs on the same idle machine.
+
+The global connection cap also bounds handlers queued at accept and sessions still cleaning up.
+Healthcheck writer cleanup aborts stalled transports when canceled. Empty transport write buffers
+avoid redundant timed drains; buffered writes still enforce backpressure and write deadlines.
 
 ## Scope and security limits
 

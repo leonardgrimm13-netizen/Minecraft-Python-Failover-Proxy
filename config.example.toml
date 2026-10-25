@@ -16,6 +16,7 @@ backlog = 256
 [main]
 # A target sharing a listener port is DNS-resolved and checked fail-closed against
 # every actually bound local address before healthchecks or player routing.
+# DNS wildcard answers are rejected; irrelevant IPv6 zones cannot hide listener aliases.
 host = "127.0.0.1"
 port = 25564
 
@@ -93,7 +94,7 @@ shutdown_cancel_timeout_seconds = 5.0
 # If true, an actual failed MAIN connect may immediately try healthy FALLBACK in auto mode.
 connect_fallback_on_main_connect_failure = false
 tcp_keepalive = false
-# Global concurrent Minecraft sessions.
+# Global Minecraft handlers, including queued accepts and sessions still cleaning up.
 max_connections = 4096
 # Zero disables the per-source-IP limit. Must not exceed max_connections.
 max_connections_per_ip = 0
@@ -106,6 +107,7 @@ new_connections_burst = 0
 mode = "auto"
 # Relative paths are resolved against the directory containing this TOML file.
 # Empty values disable file overrides. force_fallback_file wins if both files exist.
+# Access/I/O errors retain the last known mode and log a warning.
 force_fallback_file = ""
 force_main_file = ""
 file_check_interval_seconds = 1.0

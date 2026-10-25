@@ -1,0 +1,121 @@
+FINAL VALIDATION — 2026-10-25
+Repository baseline: e0b7164009ac5e277e3e4ec8e3e7ebfd32a30d70
+Branch: audit/hardening-2026-10-25
+Scope: current source and tests after B1–B10, 19 new test cases.
+
+Fresh checks collected after resuming the usage-limit interruption:
+
+$ .venv/bin/ruff check .
+exit 0
+All checks passed!
+
+$ .venv/bin/ruff format --check .
+exit 0
+53 files already formatted
+
+$ .venv/bin/mypy src tests tools
+exit 0
+Success: no issues found in 48 source files
+
+$ .venv/bin/python -m compileall -q src tests tools mc_failover_proxy.py
+exit 0; no output
+
+$ .venv/bin/python -m pytest --cov=mc_failover --cov-branch --cov-report=term-missing
+CPython 3.13.15, pytest 9.1.1, pytest-asyncio 1.4.0, debug=True
+exit 0
+TOTAL 3157 statements, 86 missed, 1100 branches, 66 partial, 96.4%
+Required test coverage of 90.0% reached. Total coverage: 96.43%
+715 passed in 4.10s
+No failures or skips. Relay branch-aware coverage 100.0%.
+
+$ /tmp/mc-audit/py310/bin/python -m pytest -q
+CPython 3.10.21; exit 0
+715 passed in 3.96s
+
+$ /tmp/mc-audit/py311/bin/python -m pytest -q
+CPython 3.11.16; exit 0
+715 passed in 3.60s
+
+$ /tmp/mc-audit/py312/bin/python -m pytest -q
+CPython 3.12.13; exit 0
+715 passed in 2.53s
+
+$ /tmp/mc-audit/py314/bin/python -m pytest -q
+CPython 3.14.4; exit 0
+715 passed in 2.21s
+
+$ .venv/bin/python -m build
+exit 0; Hatchling 1.32.4 in isolated build environments
+Successfully built minecraft_failover_proxy-1.0.0.tar.gz and minecraft_failover_proxy-1.0.0-py3-none-any.whl
+The standard build command built the wheel from the source distribution.
+
+$ .venv/bin/python tools/check_release_archives.py dist
+exit 0
+Release archive hygiene OK: minecraft_failover_proxy-1.0.0-py3-none-any.whl, minecraft_failover_proxy-1.0.0.tar.gz
+
+$ .venv/bin/python -I -S mc_failover_proxy.py --version
+exit 0
+mc-failover 1.0.0
+
+$ .venv/bin/python -I -S mc_failover_proxy.py --config config.example.toml --check-config
+exit 0
+OK: configuration is valid: config.example.toml
+
+Isolated wheel smoke:
+- Fresh venv /tmp/mc-audit/wheel-smoke; wheel installed with pip.
+- Working files under /tmp/mc-audit/wheel-run, no src directory, PYTHONPATH removed.
+- Parent interpreter and module/script invocations use -I.
+- Asserted package origin is outside checkout and metadata/package versions match 1.0.0.
+$ /tmp/mc-audit/wheel-smoke/bin/python -I /tmp/mc-audit/wheel_smoke.py
+exit 0
+wheel: isolated console/module/compatibility version+config: 6 passed
+wheel: four backend diagnostics + real monitoring liveness + redaction + relay: passed
+wheel: shutdown invariants passed; origin=/tmp/mc-audit/wheel-smoke/lib/python3.13/site-packages/mc_failover/__init__.py
+Diagnostics: --test-main, --test-fallback, --test-healthcheck,
+--test-fallback-healthcheck, --probe-live, --print-effective-config.
+Temporary token was redacted; only loopback targets used.
+
+$ .venv/bin/python -m pip_audit --local --skip-editable --cache-dir /tmp/mc-audit/pip-audit-cache
+exit 0
+No known vulnerabilities found
+minecraft-failover-proxy distribution marked as editable (skipped)
+The package itself has no runtime dependency on Python 3.11+; Python 3.10 tomli 2.5.0
+also occurs in the audited development package set. Not an image-CVE scan.
+
+Independent final read-only gate, fresh after resume:
+$ .venv/bin/python -m pytest -q tests/unit/test_endpoint_safety.py tests/unit/test_proxy_edges.py tests/unit/test_relay_edges.py tests/unit/test_monitoring_edges.py tests/unit/test_routing.py tests/unit/test_proxy_protocol.py tests/unit/test_health.py tests/unit/test_circuit_breaker.py tests/unit/test_cli.py tests/unit/test_config_branches.py tests/integration/test_proxy_and_relay.py
+exit 0
+427 passed in 1.57s
+Reviewer recomputed all 15 performance-table medians from retained JSONs and checked
+stress parameters/cleanup against raw JSONs; matched apart from normal rounding.
+Final diff review found no new confirmed source defect or weakened fail-closed/trust boundary.
+
+Historical checks directly observed in the previous execution, before /tmp was lost:
+- Clean baseline696 tests, 96.33% branch-aware coverage, green quality/build/CLI checks.
+- Regression red/green runs for B1–B10; second maintenance regression separately reproduced
+  on original Python3.14 (already passed on3.13); real local wildcard/scoped IPv6 socket repro.
+- Fresh independent second full audit:713 tests passed, identified B9; inventory follow-up B10.
+- podman build --format docker -t localhost/mc-failover-audit:20261025 . : exit0
+- Local container: UID/GID10001:10001, read-only root filesystem, capability drop, tmpfs,
+  no published ports; --probe-live and image healthcheck exit0.
+- SIGSTOP: image healthcheck exit1 unhealthy; SIGCONT: healthcheck exit0.
+- podman stop --time15: exited0; inspect reported10001:10001 exited0.
+- Podman Compose1.6.0 config parsed successfully; native Docker/Compose unavailable.
+- systemd-analyze verify on original unit failed only for missing installed /opt CLI;
+  temporary copy with actual local CLI path passed. No systemd service installed.
+- GitHub Action pins resolved against official upstream tags with git ls-remote;
+  annotated CodeQL tag peeled to commit. Existing major versions retained.
+These historical observations remain in the conversation tool evidence and report;
+temporary raw logs/probes were lost at interruption and were not recreated as fresh evidence.
+
+Retained measured performance evidence:
+- before-final-1/2/3.json and after-final-1/2/3.json, unchanged comparative workload.
+- stress-final.json:128 clients,10000 churn cycles; final tasks1/fds7;
+  tracked proxy/background tasks, sessions, limiter leases all0 at shutdown.
+- All 14 requested local scenario categories exercised at bounded scale: idle,
+  low/high concurrency, bulk/small messages, churn/held sessions, main failure/recovery,
+  fallback failure/both down, slow receiver, abrupt aborts, active shutdown.
+- No production/WAN or genuine Minecraft player load, multi-day soak, isolated CPU,
+  reliable peak-RSS, image vulnerability scan, native Docker or live systemd verification.
+
+Final git diff --check: exit0; all changed paths reviewed; no push/merge/deployment.

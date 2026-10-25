@@ -1,0 +1,104 @@
+{
+  "python": "3.13.15",
+  "platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.43",
+  "parameters": {
+    "config": "config.example.toml",
+    "output": "/tmp/mc-audit/after-final-1.json",
+    "clients": 32,
+    "cycles": 1000,
+    "rounds": 1000,
+    "bulk_bytes": 16777216,
+    "idle_seconds": 0.25
+  },
+  "idle": {
+    "wall_seconds": 0.2518839369986381,
+    "cpu_seconds": 0.012181575,
+    "tasks": 4,
+    "fds": 11,
+    "rss_kib": 28616
+  },
+  "small_packets_1_clients": {
+    "p50_ms": 0.09938899893313646,
+    "p95_ms": 0.14528599785990082,
+    "p99_ms": 0.41328500083182007,
+    "roundtrips": 1000,
+    "wall_seconds": 0.11132490499949199,
+    "cpu_seconds": 0.110397404,
+    "tasks": 8,
+    "fds": 14,
+    "rss_kib": 28736
+  },
+  "small_packets_32_clients": {
+    "p50_ms": 2.09493699730956,
+    "p95_ms": 2.8430169986677356,
+    "p99_ms": 3.193222997651901,
+    "roundtrips": 32000,
+    "wall_seconds": 2.233324127999367,
+    "cpu_seconds": 2.230840375,
+    "tasks": 101,
+    "fds": 107,
+    "rss_kib": 31752
+  },
+  "bulk": {
+    "bytes_one_way": 16777216,
+    "wall_seconds": 0.10252292400036822,
+    "cpu_seconds": 0.10244381399999991,
+    "duplex_mib_per_second": 312.1253155039264
+  },
+  "slow_reader": {
+    "tasks": 9,
+    "fds": 15,
+    "rss_kib": 36580
+  },
+  "abrupt_disconnects": {
+    "count": 32,
+    "tasks": 5,
+    "fds": 11,
+    "rss_kib": 44520
+  },
+  "churn": {
+    "p50_ms": 0.8153279995894991,
+    "p95_ms": 1.1972930005867966,
+    "p99_ms": 1.5482089984288905,
+    "cycles": 1000,
+    "wall_seconds": 0.9113905509984761,
+    "cpu_seconds": 0.910680782
+  },
+  "held_connections": {
+    "tasks": 133,
+    "fds": 139,
+    "rss_kib": 44556
+  },
+  "failover_detection_ms": 16.358810000383528,
+  "recovery_detection_ms": 17.060230999049963,
+  "after_churn": {
+    "tasks": 5,
+    "fds": 9,
+    "rss_kib": 44760,
+    "limiter_active": 0,
+    "tracked_ips": 0,
+    "baseline_fds": 11
+  },
+  "shutdown": {
+    "wall_seconds": 0.05690812800094136,
+    "proxy_tasks": 0,
+    "background_tasks": 0,
+    "limiter_active": 0,
+    "active_sessions": 0
+  },
+  "eventloop_lag": {
+    "p50_ms": 0.5811089997587258,
+    "p95_ms": 1.0762099975545423,
+    "p99_ms": 1.636303002887871
+  },
+  "runtime": {
+    "incoming": 1166,
+    "established": 1133,
+    "rejected": 33
+  },
+  "final": {
+    "tasks": 1,
+    "fds": 7,
+    "rss_kib": 44788
+  }
+}
