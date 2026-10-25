@@ -313,6 +313,7 @@ async def async_main(argv: Sequence[str] | None = None) -> int:
         config.monitoring.enabled
         and config.monitoring.allow_remote
         and config.monitoring.allow_unauthenticated_remote
+        and config.monitoring.bearer_token is None
     ):
         logger.critical("DANGEROUS CONFIGURATION: remote monitoring has no authentication")
 

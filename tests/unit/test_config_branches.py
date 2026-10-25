@@ -442,3 +442,20 @@ def test_validate_config_rejects_noncanonical_programmatic_log_level(
 ) -> None:
     broken = _replace_section(valid_config, "logging", level="info")
     _assert_invalid(broken, "[logging].level")
+
+
+def test_maintenance_symlink_loop_runtime_error_is_a_config_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = write_config(tmp_path, {"maintenance": {"force_main_file": "loop"}})
+    original_resolve = Path.resolve
+
+    def resolve(path: Path, strict: bool = False) -> Path:
+        if path.name == "loop":
+            raise RuntimeError("Symlink loop from older pathlib")
+        return original_resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    with pytest.raises(ConfigError, match=r"\[maintenance\]\.force_main_file"):
+        load_config(config_path)

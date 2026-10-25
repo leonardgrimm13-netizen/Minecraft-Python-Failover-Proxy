@@ -417,3 +417,46 @@ async def test_static_maintenance_mode_ignores_filesystem(
     snapshot = await watcher.refresh()
     assert snapshot.mode is MaintenanceMode.FORCE_MAIN
     assert snapshot.source == "config"
+
+
+@pytest.mark.asyncio
+async def test_fallback_flag_has_priority_even_when_main_flag_cannot_be_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fallback = tmp_path / "force_fallback"
+    fallback.touch()
+    main = tmp_path / "force_main"
+    watcher = MaintenanceWatcher(MaintenanceConfig(MaintenanceMode.AUTO, fallback, main, 1.0))
+    original_stat = Path.stat
+
+    def inaccessible(path: Path, *args, **kwargs):
+        if path == main:
+            raise PermissionError("unreadable main flag")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", inaccessible)
+    snapshot = await watcher.refresh()
+    assert snapshot.mode is MaintenanceMode.FORCE_FALLBACK
+
+
+@pytest.mark.asyncio
+async def test_unreadable_maintenance_flag_retains_cached_forced_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fallback = tmp_path / "force_fallback"
+    fallback.touch()
+    watcher = MaintenanceWatcher(MaintenanceConfig(MaintenanceMode.AUTO, fallback, None, 1.0))
+    await watcher.refresh()
+    original_stat = Path.stat
+
+    def inaccessible(path: Path, *args, **kwargs):
+        if path == fallback:
+            raise PermissionError("flag directory lost access")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", inaccessible)
+    with pytest.raises(PermissionError):
+        await watcher.refresh()
+    assert watcher.snapshot.mode is MaintenanceMode.FORCE_FALLBACK

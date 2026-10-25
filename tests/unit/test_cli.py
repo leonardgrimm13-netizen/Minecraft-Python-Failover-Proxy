@@ -434,3 +434,43 @@ def test_package_module_entrypoint_calls_cli_main(monkeypatch: pytest.MonkeyPatc
     runpy.run_module("mc_failover.__main__", run_name="__main__")
 
     called.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_invalid_utf8_config_returns_diagnostic_exit_code(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "invalid.toml"
+    path.write_bytes(b"\xffsecret-not-to-print")
+    assert await cli.async_main(["--config", str(path), "--check-config"]) == 2
+    error = capsys.readouterr().err
+    assert "Configuration error:" in error
+    assert "UTF-8" in error
+    assert "secret-not-to-print" not in error
+
+
+@pytest.mark.asyncio
+async def test_bearer_auth_does_not_report_unauthenticated_remote_monitoring(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = make_config(25565, 25566)
+    config = replace(
+        base,
+        monitoring=replace(
+            base.monitoring,
+            enabled=True,
+            allow_remote=True,
+            allow_unauthenticated_remote=True,
+            bearer_token="configured-secret",
+        ),
+    )
+    application = SimpleNamespace(
+        request_shutdown=MagicMock(),
+        run_until_stopped=AsyncMock(),
+        shutdown=AsyncMock(),
+    )
+    logger = MagicMock()
+    _patch_async_main_dependencies(monkeypatch, config, application, _FakeSignalLoop(), logger)
+    assert await cli.async_main([]) == 0
+    logger.critical.assert_not_called()

@@ -51,7 +51,7 @@ def make_breaker(
 
 
 @pytest.mark.parametrize("field", ["failure_window_seconds", "open_seconds"])
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), 10**1000])
 def test_constructor_rejects_non_finite_durations(field: str, value: float) -> None:
     values = {
         "enabled": True,

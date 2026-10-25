@@ -476,7 +476,7 @@ def _path_value(
         candidate = config_directory / candidate
     try:
         return candidate.resolve(strict=False)
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         raise _invalid(_path(section, key), "auflösbarer Dateipfad", value) from exc
 
 
@@ -701,6 +701,8 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError(f"Konfigurationsdatei nicht gefunden: {path}") from exc
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"Ungültiges TOML in {path}: {exc}") from exc
+    except UnicodeError as exc:
+        raise ConfigError(f"Konfigurationsdatei muss gültiges UTF-8 enthalten: {path}") from exc
     except OSError as exc:
         raise ConfigError(
             f"Konfigurationsdatei konnte nicht gelesen werden: {path} ({exc})"
