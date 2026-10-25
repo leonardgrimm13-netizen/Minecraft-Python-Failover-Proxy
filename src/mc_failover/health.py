@@ -18,20 +18,14 @@ from .minecraft_status import (
     sanitize_log_value,
 )
 from .models import HealthCheckResult, HealthStatus, TargetName
+from .relay import close_stream_writer
 from .time_utils import SYSTEM_CLOCK, Clock, format_utc, non_negative_elapsed
 
 log = logging.getLogger("mc-failover.health")
 
 
 async def close_writer(writer: asyncio.StreamWriter | None, timeout: float = 0.25) -> None:
-    if writer is None:
-        return
-    writer.close()
-    try:
-        await asyncio.wait_for(writer.wait_closed(), timeout=timeout)
-    except (asyncio.TimeoutError, ConnectionError, OSError):
-        transport = writer.transport
-        transport.abort()
+    await close_stream_writer(writer, timeout_seconds=timeout)
 
 
 def healthcheck_target(target: TargetConfig, check: HealthCheckConfig) -> TargetConfig:

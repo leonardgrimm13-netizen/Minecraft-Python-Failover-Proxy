@@ -828,3 +828,18 @@ async def test_monitor_run_propagates_cancellation_and_cancels_active_check(
     with pytest.raises(asyncio.CancelledError):
         await task
     assert cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_health_writer_cleanup_cancellation_aborts_transport() -> None:
+    from typing import cast
+
+    from tests.unit.test_relay_edges import FakeWriter as StalledWriter
+
+    writer = StalledWriter(wait_forever=True)
+    task = asyncio.create_task(health_module.close_writer(cast(asyncio.StreamWriter, writer)))
+    await writer.wait_started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert writer.transport.aborted

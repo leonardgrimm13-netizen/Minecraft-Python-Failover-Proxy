@@ -708,3 +708,35 @@ async def test_handle_client_cancellation_during_writer_cleanup_releases_state(
     assert harness.runtime.active_connections == 0
     assert harness.limiter.active == 0
     assert harness.proxy._writers == set()
+
+
+@pytest.mark.asyncio
+async def test_accept_burst_cannot_allocate_more_handlers_than_global_limit() -> None:
+    harness = ProxyHarness()
+    harness.update_config(
+        replace(harness.config, connection=replace(harness.config.connection, max_connections=1))
+    )
+    first, second = FakeWriter(), FakeWriter()
+    # No scheduling turn between accepts: admission inside handle_client has
+    # not run yet, so a limiter-only check is too late to bound task creation.
+    harness.proxy._accepted(asyncio.StreamReader(), stream_writer(first))
+    try:
+        harness.proxy._accepted(asyncio.StreamReader(), stream_writer(second))
+        assert second.closed
+        assert harness.proxy.tasks.active_count == 1
+        assert harness.runtime.rejection_reasons[RejectionReason.GLOBAL_LIMIT] == 1
+    finally:
+        await harness.proxy.shutdown_connections()
+
+
+@pytest.mark.asyncio
+async def test_cancel_before_proxy_handler_starts_releases_writer_ownership() -> None:
+    harness = ProxyHarness()
+    writer = FakeWriter()
+    harness.proxy._accepted(asyncio.StreamReader(), stream_writer(writer))
+    await harness.proxy.tasks.cancel_all(0.1)
+    # Done callbacks complete on the next turn when drain collects a task
+    # already finished by the cancellation turn.
+    await asyncio.sleep(0)
+    assert writer.closed
+    assert harness.proxy._writers == set()

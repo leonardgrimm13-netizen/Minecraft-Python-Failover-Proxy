@@ -107,7 +107,10 @@ async def read_http_request(
         or any(ord(character) < 0x21 or ord(character) == 0x7F for character in target)
     ):
         raise HttpError(400, "invalid request target")
-    parsed_target = urlsplit(target)
+    try:
+        parsed_target = urlsplit(target)
+    except ValueError as exc:
+        raise HttpError(400, "invalid request target") from exc
     if parsed_target.scheme or parsed_target.netloc or parsed_target.fragment:
         raise HttpError(400, "invalid request target")
     path = parsed_target.path
@@ -151,7 +154,10 @@ async def read_http_request(
         raise HttpError(400, "request bodies are not supported")
     lengths = collected.get("content-length", [])
     if lengths:
-        if any(not value.isdigit() for value in lengths) or len(set(lengths)) != 1:
+        if (
+            any(not value.isascii() or not value.isdigit() for value in lengths)
+            or len(set(lengths)) != 1
+        ):
             raise HttpError(400, "invalid Content-Length")
         if int(lengths[0]) != 0:
             raise HttpError(400, "request bodies are not supported")
@@ -293,6 +299,13 @@ class MonitoringServer:
         self.server: asyncio.Server | None = None
         self.tasks = TaskTracker(name="monitoring-client")
         self._active = 0
+        self._writers: set[asyncio.StreamWriter] = set()
+
+    def _client_finished(self, writer: asyncio.StreamWriter) -> None:
+        if writer in self._writers:
+            self._writers.discard(writer)
+            self._active -= 1
+            writer.close()
 
     def _accepted(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         if self.runtime.shutting_down:
@@ -303,20 +316,19 @@ class MonitoringServer:
             writer.close()
             return
         self._active += 1
+        self._writers.add(writer)
+
+        def finished(_task: asyncio.Task[None]) -> None:
+            # A coroutine canceled before its first step never runs finally.
+            # The accept callback owns both the slot and that writer until done.
+            self._client_finished(writer)
+
         try:
-            self.tasks.create(self._handle_counted(reader, writer))
+            task = self.tasks.create(self.handle(reader, writer))
+            task.add_done_callback(finished)
         except RuntimeError:
             # A callback already queued by the event loop may race with stop().
-            self._active = max(0, self._active - 1)
-            writer.close()
-
-    async def _handle_counted(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> None:
-        try:
-            await self.handle(reader, writer)
-        finally:
-            self._active = max(0, self._active - 1)
+            self._client_finished(writer)
 
     def _authorized(self, request: HttpRequest) -> bool:
         expected = self.config.monitoring.bearer_token
@@ -466,6 +478,8 @@ class MonitoringServer:
             closing_server.close()
             self.server = None
         await self.tasks.cancel_all(self.config.monitoring.write_timeout_seconds)
+        for writer in tuple(self._writers):
+            self._client_finished(writer)
         still_pending = await self.tasks.wait_remaining(
             self.config.monitoring.write_timeout_seconds
         )

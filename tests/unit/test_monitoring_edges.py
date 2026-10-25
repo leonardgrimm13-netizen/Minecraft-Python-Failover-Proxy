@@ -386,3 +386,30 @@ async def test_remote_opt_in_serves_actual_remote_bind(
     assert cast(object, returned) is listener
     assert listener.serving
     assert not listener.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"GET //[ HTTP/1.1\r\nHost: local\r\n\r\n",
+        b"GET /live HTTP/1.1\r\nHost: local\r\nContent-Length: \xb2\r\n\r\n",
+    ],
+)
+async def test_malformed_targets_and_non_ascii_lengths_return_400(raw: bytes) -> None:
+    server = make_monitoring_server()
+    writer = FakeWriter()
+    await server.handle(feed_reader(raw), cast(asyncio.StreamWriter, writer))
+    assert bytes(writer.written).startswith(b"HTTP/1.1 400 Bad Request\r\n")
+    assert writer.closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_cancel_before_monitoring_handler_starts_releases_writer_and_slot() -> None:
+    server = make_monitoring_server()
+    writer = FakeWriter()
+    server._accepted(asyncio.StreamReader(), cast(asyncio.StreamWriter, writer))
+    await server.stop()
+    assert writer.closed.is_set()
+    assert server._active == 0
+    assert server.tasks.active_count == 0
