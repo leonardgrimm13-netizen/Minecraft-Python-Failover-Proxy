@@ -440,3 +440,38 @@ async def test_active_healthcheck_reports_listener_loop_without_connecting(
     assert not result.ok
     assert result.reason == "unsafe_listener_loop"
     connect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resolved", ["0.0.0.0", "::", "::ffff:0.0.0.0"])
+async def test_dns_unspecified_target_cannot_bypass_explicit_listener_guard(
+    monkeypatch: pytest.MonkeyPatch, resolved: str
+) -> None:
+    config = make_config(25_565, 25_566, proxy_port=25_565)
+    guard = EndpointLoopGuard(config)
+    loop = asyncio.get_running_loop()
+    family = socket.AF_INET6 if ":" in resolved else socket.AF_INET
+    address = (resolved, 0, 0, 0) if family == socket.AF_INET6 else (resolved, 0)
+    monkeypatch.setattr(
+        loop, "getaddrinfo", AsyncMock(return_value=[(family, socket.SOCK_STREAM, 6, "", address)])
+    )
+    # Literal listeners stay explicit; the upstream hostname alone resolves to
+    # a wildcard. Kernels can interpret connect(wildcard) as a local connect.
+    with pytest.raises(EndpointLoopError, match="unspecified"):
+        await guard.ensure_safe("backend.example", 25_565)
+
+
+@pytest.mark.asyncio
+async def test_dns_loopback_scope_cannot_hide_the_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = make_config(25_565, 25_566, proxy_port=25_565)
+    guard = EndpointLoopGuard(replace(base, proxy=replace(base.proxy, listen_host="::1")))
+    guard.register_bound_addresses("proxy", ["::1"])
+    monkeypatch.setattr(
+        asyncio.get_running_loop(),
+        "getaddrinfo",
+        AsyncMock(return_value=[(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 0, 0, 1))]),
+    )
+    with pytest.raises(EndpointLoopError, match="local proxy listener"):
+        await guard.ensure_safe("backend.example", 25_565)
