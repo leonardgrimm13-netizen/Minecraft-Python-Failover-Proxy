@@ -317,7 +317,7 @@ async def async_main(argv: Sequence[str] | None = None) -> int:
     ):
         logger.critical("DANGEROUS CONFIGURATION: remote monitoring has no authentication")
 
-    application = FailoverApplication(config)
+    application = FailoverApplication(config, config_path=args.config)
     loop = asyncio.get_running_loop()
     installed_signals: list[signal.Signals] = []
     for caught in (signal.SIGINT, signal.SIGTERM):
@@ -326,6 +326,12 @@ async def async_main(argv: Sequence[str] | None = None) -> int:
             installed_signals.append(caught)
         except (NotImplementedError, RuntimeError):
             logger.warning("Signal handlers are unavailable for %s", caught.name)
+    if config.reload.enabled and hasattr(signal, "SIGHUP"):
+        try:
+            loop.add_signal_handler(signal.SIGHUP, application.request_reload)
+            installed_signals.append(signal.SIGHUP)
+        except (NotImplementedError, RuntimeError):
+            logger.warning("Signal handlers are unavailable for SIGHUP")
     try:
         await application.run_until_stopped()
     except OSError as exc:

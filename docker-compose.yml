@@ -20,8 +20,10 @@ services:
       # - "127.0.0.1:8080:8080/tcp"
     volumes:
       - type: bind
-        source: ./config.toml
-        target: /config/config.toml
+        # Legacy file bind is the default. For atomic reloads, set SOURCE to
+        # the parent directory and TARGET to /config (see README).
+        source: ${MC_FAILOVER_CONFIG_SOURCE:-./config.toml}
+        target: ${MC_FAILOVER_CONFIG_TARGET:-/config/config.toml}
         read_only: true
         bind:
           create_host_path: false

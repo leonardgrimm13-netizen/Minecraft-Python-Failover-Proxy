@@ -36,6 +36,11 @@ class RuntimeState:
     main_connect_successes: int = 0
     fallback_connect_successes: int = 0
     shutting_down: bool = False
+    config_generation: int = 1
+    reload_successes: int = 0
+    reload_failures: int = 0
+    last_reload_at: datetime | None = None
+    last_reload_result: str = "never"
     rejection_reasons: Counter[RejectionReason] = field(default_factory=Counter)
 
     def __post_init__(self) -> None:

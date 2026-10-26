@@ -48,11 +48,20 @@ Then use `sudo touch`/`sudo rm` on those files. FALLBACK has priority when both 
 ```bash
 systemctl status mc-failover
 journalctl -u mc-failover -f
-sudo systemctl reload-or-restart mc-failover
+sudo systemctl reload mc-failover
 ```
 
-There is no live configuration reload; `reload-or-restart` performs a graceful
-restart. `TimeoutStopSec=60s` leaves cleanup margin beyond the example's 30-second
+`systemctl reload` sends SIGHUP to the running process. With `[reload].enabled = true`
+(the default), supported changes are parsed, validated, prepared and activated as one
+generation. Established sessions retain their existing backend. An invalid file or a
+change requiring restart leaves the old generation active. Inspect the journal and
+`/state` configuration diagnostics for the result: `systemctl reload` confirms signal
+delivery, not successful activation. Publish edits with an atomic rename in the same
+directory and preserve owner/group and mode `0640`.
+
+Listener, monitoring bind/cap, admission-limit and PROXY trust/framing changes require a
+graceful `systemctl restart`; consult the main README for the exact reload boundary.
+`TimeoutStopSec=60s` leaves cleanup margin beyond the example's 30-second
 connection grace and 5-second cancellation timeout. Increase it if cleanup regularly
 reaches these deadlines or whenever either configuration value is increased.
 

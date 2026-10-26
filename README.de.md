@@ -7,8 +7,9 @@
 [English](README.md)
 
 Ein schlanker, AsyncIO-basierter TCP-Failover-Proxy für Minecraft unter Linux. Er leitet jede
-**neue TCP-Verbindung** anhand unabhängiger aktiver Health-Zustände, der Wartungsrichtlinie und
-passiver MAIN-Verbindungsfehler an MAIN oder FALLBACK weiter.
+**neue TCP-Verbindung** anhand unabhängiger aktiver Healthchecks, der Wartungsrichtlinie,
+Circuit Breaker und konservativer passiver Sitzungsfehler zum verfügbaren Backend mit höchster
+Priorität. Bestehende MAIN-/FALLBACK-Konfigurationen funktionieren unverändert.
 
 Die grundlegende Grenze ist beabsichtigt: Bestehende Spielersitzungen bleiben mit dem beim
 Verbindungsaufbau gewählten Backend verbunden. Der Proxy kann einen bereits verbundenen Spieler
@@ -21,15 +22,18 @@ Minecraft-Clients
        |
        v
 mc-failover Listener
-       |---- MAIN      (aktiver Healthcheck + passiver Circuit Breaker)
-       `---- FALLBACK  (unabhängiger aktiver Healthcheck)
+       |---- MAIN        (eigene Healthchecks + Circuit + passive Fehler)
+       |---- FALLBACK_1  (eigene Healthchecks + Circuit + passive Fehler)
+       |---- FALLBACK_2  (...)
+       `---- ...         (Prioritätsreihenfolge; keine feste Backend-Anzahl)
 
 Monitoring-Listener (optional): /live /ready /health /state /metrics
 ```
 
-MAIN- und FALLBACK-Prüfung starten parallel, bevor die Listener freigegeben werden. Jedes Ziel
-besitzt einen eigenen Status, aufeinanderfolgende Erfolgs-/Fehlerzähler, Gesamtzähler,
-Zeitstempel und Hysterese.
+Backend-Prüfungen laufen unabhängig mit konfigurierter Parallelitätsgrenze vor Freigabe
+der Listener. Jedes Backend besitzt Health-Zustand, Zähler, Zeitstempel, Recovery-Hysterese
+und Circuit-Zustand. Die folgende Tabelle beschreibt die kompatible Legacy-Konfiguration
+mit zwei Backends.
 
 Bei `maintenance.mode = "auto"` gilt:
 
@@ -84,19 +88,101 @@ unhealthy oder ungeprüft, bleibt MAIN ready, der Verlust der Failover-Kapazitä
 Gesamtstatus jedoch degraded. Lasse beide Checks aktiviert, wenn Readiness aktuelle
 Erreichbarkeit nachweisen soll.
 
+### Mehrere Backends und Prioritäten
+
+[config.multi.example.toml](config.multi.example.toml) zeigt MAIN und drei Fallbacks.
+`[[backends]]` ist ein alternatives Schema: Die Kombination mit `[main]`, `[fallback]`,
+`[healthcheck]` oder `[fallback_healthcheck]` wird abgelehnt. Die Zwei-Server-Referenz
+bleibt [config.example.toml](config.example.toml); bestehende Dateien benötigen keine
+Migration.
+
+Jedes Backend besitzt eine eindeutige `id`, `host`, `port`, `priority` (Standard 100),
+`enabled` (Standard true), optional `connect_timeout_seconds` und optionale Tabellen
+`[backends.healthcheck]` / `[backends.circuit_breaker]`. IDs enthalten 1–64 ASCII-Buchstaben/Ziffern/Unterstrich/Punkt/Bindestrich, beginnen mit
+einem Buchstaben oder einer Ziffer und dürfen nicht `NONE` lauten. Kleinere Prioritätswerte
+gewinnen; bei gleichen Werten entscheidet die Deklarationsreihenfolge. Jedes Backend
+unterstützt sämtliche bisherigen TCP-/Minecraft-Status-Healthcheck-Felder und Filter.
+Circuit-Einstellungen erben `[circuit_breaker]`; Health-Einstellungen verwenden die
+dokumentierten Health-Standardwerte.
+
+`[routing]` begrenzt unterschiedliche Connect-Versuche (`max_connect_attempts`, Standard
+16), die gesamte Connect-Folge (`connect_budget_seconds`, Standard 10) und gleichzeitig
+aktive Netzwerkprüfungen (`max_parallel_healthchecks`, Standard 16). Ein fehlgeschlagener
+Connect darf vor Bindung einer Backend-Sitzung den nächsten gesunden Kandidaten versuchen.
+Jeder Kandidat wird höchstens einmal versucht. Im Legacy-Schema behält
+`connect_fallback_on_main_connect_failure` seine bisherige Bedeutung. Im Multi-Backend-Modus
+versucht automatisches Routing weitere Kandidaten innerhalb dieser Grenzen.
+
+`force_main` und `force_fallback`, einschließlich Wartungsdateien, adressieren exakt die
+IDs `MAIN` und `FALLBACK`. Benenne ein explizites Backend `FALLBACK`, wenn diese bisherigen
+Overrides es steuern sollen. Für IDs wie `FALLBACK_2` dienen `mode = "force_target"` und
+`force_target = "FALLBACK_2"`. Das Ziel muss existieren und aktiviert sein. Erzwungenes
+Routing bleibt fail-closed und versucht kein anderes Backend. Bestätigte Recovery führt
+neue Verbindungen zum ersten geeigneten Backend zurück; bestehende Fallback-Sitzungen
+bleiben verbunden.
+
 ### Passive Fehler und Circuit Breaker
 
-Fehlgeschlagene reale MAIN-Connects werden in einem monotonen gleitenden Zeitfenster gezählt. Bei
-`failure_threshold` öffnet der Circuit für `open_seconds`; neue automatische Verbindungen umgehen
-den MAIN-Timeout und verwenden den routable FALLBACK. Danach dürfen höchstens
-`half_open_max_attempts` Tests gleichzeitig MAIN versuchen. Ein erfolgreicher echter Connect
-schließt und leert den Circuit, ein fehlgeschlagener Test öffnet ihn erneut. Ein erfolgreicher
-aktiver MAIN-Check darf ihn erst nach Ablauf der vollständigen Open-Zeit schließen.
+Reale Connect-Fehler und nachgewiesene Backend-Reset-/Lese-/Schreibfehler werden diesem
+Backend zugeordnet. Relay-Ergebnisse unterscheiden Client-/Backend-I/O, sauberes EOF,
+Idle-/Write-Timeouts, Half-Close-Drain-Ablauf, Cancellation und Shutdown. Klassifiziert
+wird anhand Operation, Richtung und Exception-Typ statt Exception-Texten. EOF,
+Client-Reset, reguläre Statusbeendigung, Idle-Timeout, Cancellation oder Shutdown allein
+beweisen keinen Backend-Ausfall. Lokale Ressourcenfehler des Proxys, etwa erschöpfte
+Dateideskriptoren, versetzen gesunde Backends weder in Quarantäne noch öffnen sie deren
+Circuits. Fehlgeschlagene Verbindungsversuche bleiben in den Connect-Zählern sichtbar.
 
-FALLBACK-Connect-Fehler haben eigene Metriken, lösen aber keine rekursive weitere Route aus; es
-entsteht keine MAIN/FALLBACK-Endlosschleife. Mit
-`connect_fallback_on_main_connect_failure = true` darf ein fehlgeschlagener MAIN-Connect genau
-einen unmittelbaren FALLBACK-Versuch durchführen, nur in `auto` und nur bei routable FALLBACK.
+`[passive_health]` aktiviert ein begrenztes gleitendes Fenster (`failure_threshold = 3`,
+`failure_window_seconds = 30`) und Quarantäne (`quarantine_seconds = 10`). Wiederholte
+starke Indizien schließen das Backend für neue Sitzungen aus. Aktive Checks bestätigen
+Recovery nach der Quarantäne und berücksichtigen Erfolgs-/Zeitschwellen des Backends.
+Deaktivierte aktive Checks sind eine ausdrücklich optimistische Richtlinie und erlauben
+nach Quarantäne einen begrenzten erneuten Versuch. `early_session_seconds = 0` deaktiviert
+die Verifikation früher EOFs; ein positiver Wert fordert bei frühem Backend-EOF eine
+zusammengefasste aktive Prüfung an. EOF selbst zählt nicht als Fehler. Checks verwenden
+vorhandene Backend-Worker; es entsteht keine Health-Task pro Spieler.
+
+Erfolgreiche TCP-Annahme löscht nicht die getrennte Historie nachgewiesener Sitzungsfehler.
+Circuit Breaker behalten begrenzte Half-Open-Tests und Open-Zeiten. Im Legacy-Schema
+bleibt MAINs bisheriger Connect-Circuit erhalten, FALLBACKs Circuit bleibt deaktiviert.
+Explizite Multi-Backend-Einträge können eigene Circuits aktivieren. Sitzungsdaten oder
+Minecraft-Loginzustand werden nie auf einem anderen Backend wiederholt. Defekte
+Sitzungen enden; andere laufen weiter. Eine bestehende Minecraft-Sitzung ist nicht migrierbar.
+
+### Lokaler Java-Status und Wartungs-MOTD
+
+`[status].enabled = false` ist der kompatible Standard. Aktiviert liefert nicht verfügbares
+Routing eine lokale Offline-Java-Statusantwort. Erzwungene Modi verwenden bei lokalem
+Handling immer die Wartungs-MOTD, auch bei nicht verfügbarem Ziel. `maintenance = true`
+fängt Status im erzwungenen Modus zusätzlich bei verfügbarem Backend lokal ab. Verfügbare Backends behalten normales
+Forwarding, sofern nicht `always = true` zusätzlich lokale Online-/Fallback-MOTDs
+aktiviert. Login folgt weiterhin der Routing-Richtlinie; nicht verfügbare Logins werden
+ohne simulierten Login-Erfolg geschlossen. Legacy-Serverlisten-Pings vor 1.7 und
+Bedrock/RakNet gehören nicht zum Umfang dieses Responders.
+
+Der Dienst liest nach validiertem vertrauenswürdigem PROXY Protocol v1/v2 ausschließlich
+einen begrenzten initialen Handshake. Weitergeleitete Logins erhalten alle untersuchten
+Bytes unverändert und in Reihenfolge, einschließlich fragmentierter Handshakes und bereits
+im TCP-Stream gepufferter Daten. Gameplay bleibt undurchsichtig. Lokaler Status unterstützt
+Request/Response und die acht Ping-/Pong-Bytes des Clients.
+
+Konfiguriere `motd_online`, `motd_maintenance`, `motd_fallback`, `motd_offline`,
+`version_name` und `protocol_version` (Standard -1, unspezifizierte/inkompatible Version).
+MOTDs sind JSON-Textkomponenten mit escaped Text, Zeilenumbrüchen und Minecraft-`§`-Formatierung;
+jedes Textfeld ist auf 8192 UTF-8-Bytes begrenzt. `dynamic_hint = true` ergänzt den öffentlichen
+Zustand. Lasse `players_online` und `players_max` gemeinsam weg, wenn verlässliche Zahlen
+fehlen: Es werden keine erfundenen Spielerzahlen ausgegeben. Konfigurierte Werte sind
+Angaben des Administrators und keine gemessene Spielerpopulation. `favicon` akzeptiert nur
+ein eingebettetes `data:image/png;base64,...` mit validiertem 64×64-PNG bis 16 KiB; weder
+Dateien noch Remote-URLs werden geöffnet. PNG-Framing, Prüfsummen und begrenzte
+Dekomprimierung werden beim Konfigurationsladen geprüft. Komprimierte Metadaten-Chunks
+(`iCCP`, `zTXt`, `iTXt`) werden vor der Auslieferung an Clients abgewiesen.
+
+`handshake_timeout_seconds = 2`, `session_timeout_seconds = 5`,
+`max_handshake_bytes = 2048` und `max_concurrent = 64` begrenzen Klassifizierung, kompletten
+Statusaustausch, Eingabepuffer und parallele Untersuchungen. VarInts sind auf fünf Bytes,
+Antwort-JSON auf 64 KiB begrenzt. Vorhandene globale, Quell-IP- und Rate-Limits gelten
+weiterhin. Wähle für Produktion Deadlines passend zur erwarteten Client-Latenz.
 
 ## TCP-Relay und Herunterfahren
 
@@ -126,11 +212,47 @@ Uhr. Extern sichtbare Start-/Check-/Wechsel-/Open-Zeitstempel sind UTC mit Zeitz
 ISO-8601-`Z`; Prometheus-Zeitstempel-Gauges verwenden Unix-Sekunden. Sprünge der Systemuhr ändern
 keine Timeout-Dauern, und angezeigte Alter/Uptime werden nie negativ.
 
+## Atomarer Konfigurations-Reload
+
+Linux-`SIGHUP` lädt bei `[reload].enabled = true` (Standard) den ursprünglichen
+Konfigurationspfad neu. Es gibt keinen öffentlichen administrativen HTTP-Endpunkt und
+keinen automatischen Dateiwächter. Wiederholte Signale werden in einem Worker zusammengefasst:
+
+```bash
+kill -HUP <proxy-pid>
+sudo systemctl reload mc-failover
+docker compose kill -s HUP mc-failover
+```
+
+Ein Kandidat wird außerhalb des Event Loops eingelesen, vollständig geparst und validiert.
+DNS-/Listener-Schleifenprüfungen werden wiederholt; neue oder geänderte Backends werden
+vor Aktivierung geprüft. Eine Aktivierung ohne `await` tauscht die gesamte Generation.
+Unveränderte Endpunkte behalten gültige Health-, Circuit- und Statistikzustände;
+reine Prioritätsänderungen erhalten ihren Zustand. Geänderte Endpunkte starten frische
+Checks. Entfernte Ziele erhalten keine neuen Sitzungen; bestehende Sitzungen behalten
+ihre ursprüngliche Konfiguration und Sockets. Alte Health- und Wartungs-Worker werden abgebrochen
+und eingesammelt. Parsing-, Validierungs- oder Vorbereitungsfehler erhalten die gesamte
+alte Generation.
+
+Backend-Listen/Prioritäten, Healthchecks, Wartung, Circuits, passive Health, MOTDs,
+Logging-Level, Verbindungs-Timeouts und Monitoring-Authentifizierung/-Timeouts können
+neu geladen werden. Änderungen am Proxy-Listener einschließlich Backlog, PROXY-Protocol-
+Vertrauen/-Framing, globalen/Quell-IP-/Rate-Limits sowie Monitoring-Aktivierung/Bind/Port/
+Verbindungslimit erfordern Neustart; der gesamte Kandidat wird abgelehnt. Bestehende
+Sitzungen behalten ihre erfassten Transport-Deadlines und Optionen. Prüfe das
+`configuration`-Objekt von `/state` und das Journal: Signalauslieferung bestätigt keinen
+erfolgreichen Reload. Die Diagnose enthält Generation, Erfolgs-/Fehlerzähler, letzten
+erfolgreichen UTC-Zeitpunkt und ein begrenztes Ergebnis ohne Konfigurationsgeheimnisse.
+
+Schreibe eine vollständige temporäre Datei neben `config.toml`, erhalte ihre beschränkten
+Rechte und benenne sie atomar um. Binde unter Docker das übergeordnete Konfigurationsverzeichnis
+ein: Einzeln eingebundene Dateien bleiben nach Ersetzung auf dem Host sonst beim alten Inode.
+
 ## Voraussetzungen und Installation
 
 - Linux ist die primäre Zielplattform.
 - CPython 3.10 oder neuer (CI ist für 3.10 bis 3.14 konfiguriert).
-- MAIN und FALLBACK sind vom Proxy-Host erreichbar.
+- Mindestens ein Backend ist vom Proxy-Host erreichbar.
 
 Installation aus einem Checkout:
 
@@ -172,10 +294,11 @@ Führe vor dem Neustart eines aktualisierten Dienstes immer `--check-config` aus
 aktuellen Bereichen:
 
 - striktes Parsing, Listener/Backlog, MAIN und FALLBACK;
-- beide Healthchecks und Minecraft-Statusfilter;
+- Healthchecks und Minecraft-Statusfilter pro Backend;
 - Connect-/Write-/Idle-/Drain-/Shutdown-Deadlines, globale/Per-IP-Limits und Token-Bucket-Rate-Limit;
 - Wartungsmodus und asynchron abgefragte Override-Dateien;
-- Circuit Breaker;
+- individuelle Circuits, passive Quarantäne und begrenztes Prioritätsrouting;
+- lokale Java-Status/MOTDs und atomarer SIGHUP-Reload;
 - PROXY-Protocol-Vertrauen, Versionen, Deadline und Größenlimit;
 - geschütztes Monitoring und Access-Logging.
 
@@ -294,6 +417,28 @@ Client-Ablehnungswerten; sie behält die historische, stets nullwertige Serie
 `reason="monitoring_limit"`. Monitoring-Überlastung zählt ausschließlich
 `mc_failover_monitoring_rejected_connections_total`.
 
+Alle Routing-Endpunkte enthalten außerdem `selected_backend`, eine nach konfigurierter ID
+indizierte `backends`-Zuordnung und eine `configuration`-Reload-Diagnose. Jedes Backend zeigt
+Aktivierung, Priorität, Health/letzten Check/Latenz, Routbarkeit, Auswahl, aktive Sitzungen,
+Connect-/Passivzähler, Quarantäne und Circuit. Konfigurierte Adressen bleiben auf sensibles
+`/state` beschränkt. Legacy-MAIN-/FALLBACK-Felder und Metrikfamilien bleiben verfügbar;
+für genaue Multi-Backend-Diagnose dienen Backend-IDs. Bei ersetztem Backend-Ziel können
+Zähler zurückgesetzt werden; entfernte IDs verschwinden aus der aktuellen Registry,
+während ihre bestehenden Sitzungen auslaufen.
+
+Zusätzliche Prometheus-Familien verwenden ausschließlich `backend="<konfigurierte ID>"`,
+feste Health-/Circuit-Enums oder keine Labels. Sie umfassen `mc_failover_backend_enabled`,
+`_priority`, `_selected`, `_routable`, `_active_connections`, `_connect_failures_total`,
+`_connect_successes_total`, `_passive_failures_total`, `_passive_failures_in_window`,
+`_quarantine_remaining_seconds`, `_healthcheck_successes_total`, `_healthcheck_failures_total`,
+`_health_status`, `_healthcheck_latency_milliseconds`, `_healthcheck_age_seconds`,
+`_circuit_breaker_state`, `_circuit_breaker_open_total` und `_circuit_breaker_retry_after_seconds`,
+alle mit Präfix `mc_failover_backend`. Reload-Familien sind `mc_failover_config_generation`,
+`mc_failover_config_reload_successes_total`, `mc_failover_config_reload_failures_total` und
+`mc_failover_config_last_reload_timestamp_seconds` (null vor dem ersten Erfolg). Verwende
+stabile Backend-IDs über Änderungen hinweg, um Label-Kardinalität zu kontrollieren.
+Client-IPs, Spielernamen oder freie Fehlertexte werden niemals zu Metrik-Labels.
+
 ## Sicherheit des PROXY Protocol
 
 Ein- und ausgehendes PROXY Protocol v1/v2 sind unabhängig. `version` ist der gemeinsame Default;
@@ -341,14 +486,14 @@ von `/live`; ein gestoppter oder hängender Eventloop wird deshalb unhealthy. Da
 aktiviert Monitoring nur auf Container-Loopback, Compose veröffentlicht den Port nicht. Eigene
 Container-Konfigurationen müssen Monitoring ebenfalls für den Image-Healthcheck aktivieren. Ist
 ein Bearer-Token konfiguriert, liest die Probe es intern aus der gemounteten Konfiguration, ohne es
-auszugeben. Starte den Container unmittelbar nach Änderungen an der gemounteten Konfiguration neu:
-Der laufende Prozess behält seine Startkonfiguration, während jede Probe die aktuelle Datei liest.
+auszugeben. Sende nach Änderungen an der gemounteten Konfiguration SIGHUP und prüfe den Reload-Erfolg.
+Die Liveness-Probe liest Monitoring-Einstellungen aus der Datei: Stelle einen abgelehnten
+Kandidaten mit geänderten Probe-Zugangsdaten zurück oder starte bei erforderlichen Änderungen neu.
 Bei sehr langen initialen Backend-Check-Timeouts muss die Health-Start-Gnadenfrist des
 Orchestrators entsprechend erhöht werden.
 
 ```bash
 cp config.example.toml config.toml
-# Enthält die Datei ein Token, beschränke sie und erhalte Leserechte für Container-GID 10001.
 sudo chown root:10001 config.toml
 sudo chmod 0640 config.toml
 docker compose config
@@ -362,7 +507,22 @@ veröffentlicht. Um Monitoring ausschließlich an Host-Loopback zu veröffentlic
 Mapping ein und konfiguriere im Container einen nichtlokalen Bind (`0.0.0.0`),
 `allow_remote = true` und ein Bearer-Token.
 
-Das notwendige Volume ist der schreibgeschützte Bind von `/config/config.toml`. Erstelle für
+Der schreibgeschützte Standard-Bind bleibt `./config.toml` → `/config/config.toml`;
+bestehende Compose-Installationen funktionieren unverändert. Für atomar ersetzte Dateien
+beim Hot-Reload kann ein Verzeichnis-Bind aktiviert werden:
+
+```bash
+sudo install -d -o root -g 10001 -m 0750 config
+sudo install -o root -g 10001 -m 0640 config.toml config/config.toml
+export MC_FAILOVER_CONFIG_SOURCE=./config
+export MC_FAILOVER_CONFIG_TARGET=/config
+docker compose up -d
+```
+
+Erhalte beide Variablen in der Deployment-Umgebung oder Compose-Datei `.env`. Eigentümer,
+Gruppe und Lese-/Suchrechte müssen nach Ersetzung weiterhin stimmen. Ein Einzeldatei-Bind
+behält bei Rename auf dem Host den alten Inode; nutze für atomare Updates den Verzeichnis-Bind.
+Erstelle für
 dateibasierte Wartung auf dem Host ein Verzeichnis `state/`, kommentiere den schreibgeschützten
 `/state`-Bind ein und konfiguriere `/state/force_fallback` sowie `/state/force_main`; der
 Host-Operator erstellt oder entfernt diese Marker. Ein dauerhaftes, von der Anwendung
@@ -428,6 +588,24 @@ Sitzungen. Abgebrochene Healthcheck-Cleanups brechen blockierte Transporte ab. L
 Transport-Schreibpuffer vermeiden redundante zeitbegrenzte Drains; gepufferte Schreibvorgänge
 behalten Backpressure und Schreibdeadlines.
 
+Der Feature-Lasttest ergänzt 100/500/2000 gehaltene Verbindungen, parallelen lokalen
+Java-Status/Pong, wiederholte Reloads mit Byteprüfung bestehender Sitzungen, zwei ausgefallene
+Backends und Recovery:
+
+```bash
+python tools/benchmark_features.py --clients 100 --output /tmp/features-100.json
+python tools/benchmark_features.py --clients 500 --output /tmp/features-500.json
+python tools/benchmark_features.py --clients 2000 --output /tmp/features-2000.json
+python tools/benchmark_features.py --clients 500 --backend-hostname --output /tmp/features-dns.json
+```
+
+Er meldet CPU-/Wall-Zeit, RSS, Tasks, Dateideskriptoren/Sockets, Connect-/Relay-/Status-Perzentile,
+Loop-Verzögerung und Cleanup. Connect-Latenz beinhaltet das initiale Login-Echo; Reload-Perzentile
+beinhalten einen parallelen Byte-Roundtrip auf jeder gehaltenen Verbindung über die Aktivierung hinweg. Das
+Dateilimit muss ungefähr vier Sockets pro Client erlauben, weil alle Gegenstellen im
+Harness-Prozess laufen. Die Zahlen enthalten Fake-Backends und Clients. Aufgezeichnete
+Messwerte und Prüfgrenzen stehen in der [Feature-Validierung](docs/FEATURE-VALIDATION.md).
+
 ## Umfang und Sicherheitsgrenzen
 
 - Dies ist ein TCP-Failover-Router, kein Ersatz für Velocity/BungeeCord und kein System zur
@@ -436,11 +614,14 @@ behalten Backpressure und Schreibdeadlines.
   Netzwerkkontrollen.
 - Veröffentliche nur den Minecraft-Listener. Monitoring bleibt lokal oder authentifiziert.
 - Starte den Dienst nicht als root; Port 25565 benötigt das unter Linux nicht.
-- Sind beide Ziele nicht verfügbar, werden neue Clients geschlossen, statt zu einem bekanntermaßen
-  defekten Ziel gesendet.
+- Ohne verfügbares Backend schließen Login-Verbindungen; optionaler lokaler Java-Status antwortet weiter.
 - Python kann DNS-/NSS- und Wartungsdatei-Awaits zeitlich begrenzen, einen bereits im
   Betriebssystem blockierten Resolver- oder Netzwerkdateisystem-Workerthread aber nicht gewaltsam
   beenden. Nutze zuverlässige lokale NSS-/Resolver-Konfiguration und lokale Wartungspfade; die
   Stop-Deadline des Service-Managers bleibt die letzte betriebliche Grenze.
 
 Lizenziert unter der [MIT-Lizenz](LICENSE).
+
+Die finale Testmatrix, Lastmessungen und Cleanup-Regressionen stehen im
+[Validierungsbericht](docs/FEATURE-VALIDATION.md). Der vollständige
+[Abschlussbericht A–I](docs/ABSCHLUSSBERICHT-FAILOVER.md) enthält außerdem die komplette Beispielkonfiguration.

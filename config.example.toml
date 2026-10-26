@@ -103,8 +103,10 @@ new_connections_per_second = 0.0
 new_connections_burst = 0
 
 [maintenance]
-# auto, force_main, or force_fallback.
+# auto, force_main, force_fallback, or force_target.
 mode = "auto"
+# Required only for force_target; must name an enabled configured backend.
+# force_target = "MAIN"
 # Relative paths are resolved against the directory containing this TOML file.
 # Empty values disable file overrides. force_fallback_file wins if both files exist.
 # Access/I/O errors retain the last known mode and log a warning.
@@ -113,12 +115,69 @@ force_main_file = ""
 file_check_interval_seconds = 1.0
 
 [circuit_breaker]
-# Passive failures are failed real MAIN connection attempts, not active checks.
+# MAIN circuit: failed real connects plus typed established-backend I/O evidence.
+# Successful TCP acceptance does not erase the separate session-failure history.
 enabled = true
 failure_threshold = 3
 failure_window_seconds = 10.0
 open_seconds = 15.0
 half_open_max_attempts = 1
+
+[routing]
+# Distinct backend attempts before any session is bound; forced modes never retry elsewhere.
+# Multi-backend mode tries the next routable entry; legacy mode retains the connection flag above.
+max_connect_attempts = 16
+# Total budget for selecting/connecting all candidates, including outbound PROXY setup.
+connect_budget_seconds = 10.0
+# Independent backend tasks share this cap on checks doing network I/O.
+max_parallel_healthchecks = 16
+
+[passive_health]
+# Proven backend reset/read/write errors feed this bounded sliding window.
+# Normal EOF, client disconnect, idle timeout, shutdown and cancellation do not count.
+enabled = true
+failure_threshold = 3
+failure_window_seconds = 30.0
+quarantine_seconds = 10.0
+# Zero disables ambiguous early-session verification. A positive value requests
+# a coalesced active check after an early backend EOF; EOF alone never quarantines.
+early_session_seconds = 0.0
+
+[status]
+# Disabled preserves completely transparent legacy forwarding.
+enabled = false
+# With enabled=true, always=true answers status locally even with a usable backend.
+always = false
+# Answer status locally during forced maintenance; login still follows routing policy.
+maintenance = true
+# One deadline for bounded handshake classification, then a complete local status exchange.
+handshake_timeout_seconds = 2.0
+session_timeout_seconds = 5.0
+max_handshake_bytes = 2048
+# Independent cap; global/source/rate limits still apply to every accepted connection.
+max_concurrent = 64
+# Plain text components; Minecraft section-sign formatting and newlines are supported.
+motd_online = "Minecraft network online"
+motd_maintenance = "Minecraft network under maintenance"
+motd_fallback = "Main server offline; fallback available"
+motd_offline = "Server temporarily offline\nPlease try again later."
+version_name = "Failover Proxy"
+# -1 advertises an unspecified/incompatible protocol rather than claiming a real server version.
+protocol_version = -1
+# Omit both when reliable counts are unavailable. Set only truthful administrator-supplied counts.
+# players_online = 0
+# players_max = 100
+# Optional inline data:image/png;base64,...; valid bounded 64x64 PNG only (no file or URL reads).
+# favicon = "data:image/png;base64,..."
+# Append a bounded public operating-state hint, without internal backend addresses.
+dynamic_hint = false
+
+[reload]
+# Linux SIGHUP reloads supported changes atomically; disabled ignores reload requests.
+enabled = true
+# Backend/priority/health/maintenance/circuit/passive/status changes are supported.
+# Proxy listener, admission/rate limits, PROXY trust/framing and monitoring bind/cap require restart.
+# Logging, transport deadlines and monitoring authentication/timeouts can reload.
 
 [proxy_protocol]
 # Inbound PROXY v1/v2 is disabled by default. When accept=true, fail-closed
