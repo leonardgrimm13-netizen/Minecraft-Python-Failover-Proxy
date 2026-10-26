@@ -347,6 +347,7 @@ async def test_async_main_runs_application_registers_signals_and_warns_for_dange
     )
     application = SimpleNamespace(
         request_shutdown=MagicMock(),
+        request_reload=MagicMock(),
         run_until_stopped=AsyncMock(),
         shutdown=AsyncMock(),
     )
@@ -357,7 +358,7 @@ async def test_async_main_runs_application_registers_signals_and_warns_for_dange
     assert await cli.async_main([]) == 0
     application.run_until_stopped.assert_awaited_once_with()
     application.shutdown.assert_not_awaited()
-    assert loop.added == [signal.SIGINT, signal.SIGTERM]
+    assert loop.added == [signal.SIGINT, signal.SIGTERM, signal.SIGHUP]
     assert loop.removed == loop.added
     assert logger.critical.call_count == 2
 
@@ -370,6 +371,7 @@ async def test_async_main_tolerates_unavailable_signal_handlers(
     config = make_config(25565, 25566)
     application = SimpleNamespace(
         request_shutdown=MagicMock(),
+        request_reload=MagicMock(),
         run_until_stopped=AsyncMock(),
         shutdown=AsyncMock(),
     )
@@ -378,7 +380,7 @@ async def test_async_main_tolerates_unavailable_signal_handlers(
     _patch_async_main_dependencies(monkeypatch, config, application, loop, logger)
 
     assert await cli.async_main([]) == 0
-    assert logger.warning.call_count == 2
+    assert logger.warning.call_count == 3
     assert loop.removed == []
 
 
@@ -389,6 +391,7 @@ async def test_async_main_handles_listener_error_and_removes_handlers(
     config = make_config(25565, 25566)
     application = SimpleNamespace(
         request_shutdown=MagicMock(),
+        request_reload=MagicMock(),
         run_until_stopped=AsyncMock(side_effect=OSError("bind failed")),
         shutdown=AsyncMock(),
     )
@@ -399,7 +402,7 @@ async def test_async_main_handles_listener_error_and_removes_handlers(
     assert await cli.async_main([]) == 1
     application.shutdown.assert_awaited_once_with()
     logger.error.assert_called_once_with("Listener startup failed error=%s", "OSError")
-    assert loop.removed == [signal.SIGINT, signal.SIGTERM]
+    assert loop.removed == [signal.SIGINT, signal.SIGTERM, signal.SIGHUP]
 
 
 @pytest.mark.asyncio
@@ -467,6 +470,7 @@ async def test_bearer_auth_does_not_report_unauthenticated_remote_monitoring(
     )
     application = SimpleNamespace(
         request_shutdown=MagicMock(),
+        request_reload=MagicMock(),
         run_until_stopped=AsyncMock(),
         shutdown=AsyncMock(),
     )

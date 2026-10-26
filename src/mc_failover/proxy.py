@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
+from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any
 
 from .circuit_breaker import CircuitBreaker, CircuitPermit
@@ -19,11 +22,34 @@ from .proxy_protocol import (
     is_trusted_proxy,
     read_proxy_header_for_version,
 )
-from .relay import close_stream_writer, configure_tcp_writer, relay_streams
+from .registry import BackendRuntime
+from .relay import (
+    PipeEnd,
+    RelayErrorKind,
+    _error_result,
+    classify_relay_result,
+    close_stream_writer,
+    configure_tcp_writer,
+    relay_streams,
+)
 from .routing import Router, RoutingDecision
 from .runtime import RuntimeState, TaskTracker
+from .runtime_config import RuntimeConfiguration
+
+_CONNECTION_SNAPSHOT: ContextVar[RuntimeConfiguration | None] = ContextVar(
+    "mc_failover_connection_snapshot", default=None
+)
 
 log = logging.getLogger("mc-failover.proxy")
+
+
+@dataclass(frozen=True, slots=True)
+class _BackendConnection:
+    decision: RoutingDecision
+    entry: BackendRuntime
+    reader: asyncio.StreamReader
+    writer: asyncio.StreamWriter
+    permit: CircuitPermit | None
 
 
 def _endpoint(value: Any) -> tuple[str, int] | None:
@@ -67,6 +93,20 @@ class ProxyServer:
         self._closing_server: asyncio.Server | None = None
         self.tasks = TaskTracker(name="minecraft-client")
         self._writers: set[asyncio.StreamWriter] = set()
+        self._snapshot: RuntimeConfiguration | None = None
+
+    def activate(self, snapshot: RuntimeConfiguration) -> None:
+        self._snapshot = snapshot
+        self.config = snapshot.config
+        self.router = snapshot.router
+        self.main_health = snapshot.router.main_health
+        self.fallback_health = snapshot.router.fallback_health
+        self.circuit_breaker = snapshot.router.circuit_breaker
+        self.endpoint_guard = snapshot.endpoint_guard
+
+    def _connection_config(self) -> AppConfig:
+        snapshot = _CONNECTION_SNAPSHOT.get()
+        return snapshot.config if snapshot is not None else self.config
 
     def _accepted(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self.runtime.incoming_connection_received()
@@ -167,7 +207,8 @@ class ProxyServer:
         reader: asyncio.StreamReader,
         peer_ip: str,
     ) -> ProxyProtocolInfo | None:
-        protocol = self.config.proxy_protocol
+        config = self._connection_config()
+        protocol = config.proxy_protocol
         if not protocol.accept:
             return None
         if not is_trusted_proxy(
@@ -177,7 +218,7 @@ class ProxyServer:
         ):
             raise PermissionError("untrusted_proxy")
         return await read_proxy_header_for_version(
-            _accept_version(self.config),
+            _accept_version(config),
             reader,
             protocol.header_timeout_seconds,
             max_header_bytes=protocol.max_header_bytes,
@@ -188,7 +229,7 @@ class ProxyServer:
         inbound: ProxyProtocolInfo | None,
         client_writer: asyncio.StreamWriter,
     ) -> bytes:
-        version = _send_version(self.config)
+        version = _send_version(self._connection_config())
         if inbound is not None:
             if inbound.family == "UNKNOWN":
                 return build_proxy_unknown_header_for_version(version)
@@ -221,26 +262,35 @@ class ProxyServer:
         client_writer: asyncio.StreamWriter,
     ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         server_writer: asyncio.StreamWriter | None = None
+        config = self._connection_config()
+        snapshot = _CONNECTION_SNAPSHOT.get()
+        guard = snapshot.endpoint_guard if snapshot is not None else self.endpoint_guard
+        entry = (
+            snapshot.registry.entries.get(target.backend_id or target.name.value)
+            if snapshot is not None
+            else None
+        )
+        timeout = entry.config.connect_timeout_seconds if entry is not None else None
         try:
-            server_reader, connected_writer = await self.endpoint_guard.open_connection(
+            server_reader, connected_writer = await guard.open_connection(
                 target.host,
                 target.port,
-                timeout_seconds=self.config.connection.timeout_seconds,
+                timeout_seconds=timeout or config.connection.timeout_seconds,
             )
             server_writer = connected_writer
             self._writers.add(connected_writer)
-            configure_tcp_writer(connected_writer, keepalive=self.config.connection.tcp_keepalive)
-            if self.config.proxy_protocol.send:
+            configure_tcp_writer(connected_writer, keepalive=config.connection.tcp_keepalive)
+            if config.proxy_protocol.send:
                 connected_writer.write(self._outbound_proxy_header(inbound, client_writer))
                 await asyncio.wait_for(
-                    connected_writer.drain(), timeout=self.config.connection.write_timeout_seconds
+                    connected_writer.drain(), timeout=config.connection.write_timeout_seconds
                 )
             return server_reader, connected_writer
         except BaseException:
             if server_writer is not None:
                 await close_stream_writer(
                     server_writer,
-                    timeout_seconds=self.config.connection.write_timeout_seconds,
+                    timeout_seconds=config.connection.write_timeout_seconds,
                 )
                 self._writers.discard(server_writer)
             raise
@@ -275,11 +325,159 @@ class ProxyServer:
         log.warning("MAIN connect failed; routed connection directly to FALLBACK")
         return fallback, reader, writer
 
+    async def _connect_candidates(
+        self,
+        decision: RoutingDecision,
+        router: Router,
+        inbound: ProxyProtocolInfo | None,
+        client_writer: asyncio.StreamWriter,
+    ) -> _BackendConnection | None:
+        config = self._connection_config()
+        registry = router.registry
+        attempted: set[str] = set()
+        maximum = min(config.routing.max_connect_attempts, len(registry.entries))
+        deadline = asyncio.get_running_loop().time() + config.routing.connect_budget_seconds
+        for attempt in range(maximum):
+            selected = decision.target
+            if selected is None:
+                return None
+            target = selected
+            backend_id = target.id
+            entry = registry.entries[backend_id]
+            permit = decision.circuit_permit
+            resolved = False
+            transferred = False
+            writer: asyncio.StreamWriter | None = None
+            attempted.add(backend_id)
+
+            async def connect_owned(
+                selected_target: Target = target,
+            ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+                nonlocal writer
+                # Capture ownership inside wait_for's operation before its
+                # result crosses a task boundary on Python 3.10.
+                reader, writer = await self._connect(selected_target, inbound, client_writer)
+                return reader, writer
+
+            try:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    return None
+                try:
+                    reader, connected_writer = await asyncio.wait_for(
+                        connect_owned(), timeout=remaining
+                    )
+                except (asyncio.TimeoutError, ConnectionError, OSError) as exc:
+                    self.runtime.connect_failed(target.name)
+                    entry.connect_failures += 1
+                    evidence = _error_result("client_to_server", PipeEnd.WRITE_ERROR, 0, exc)
+                    if evidence.error_kind in {
+                        RelayErrorKind.RESET,
+                        RelayErrorKind.BROKEN_PIPE,
+                        RelayErrorKind.NETWORK,
+                        RelayErrorKind.TIMEOUT,
+                    }:
+                        registry.record_passive_failure(backend_id, "connect_failed")
+                        if permit is not None:
+                            await entry.circuit.record_failure(permit)
+                            resolved = True
+                    else:
+                        registry.request_check(backend_id)
+                    log.warning(
+                        "Upstream connect failed backend=%s error=%s",
+                        backend_id,
+                        type(exc).__name__,
+                    )
+                    local_resource_failure = isinstance(exc, OSError) and exc.errno in {
+                        errno.EMFILE,
+                        errno.ENFILE,
+                        errno.ENOMEM,
+                        errno.ENOBUFS,
+                        errno.EADDRNOTAVAIL,
+                    }
+                    if (
+                        local_resource_failure
+                        or decision.maintenance_mode is not MaintenanceMode.AUTO
+                        or (
+                            not config.backends
+                            and not config.connection.connect_fallback_on_main_connect_failure
+                        )
+                        or attempt + 1 >= maximum
+                        or asyncio.get_running_loop().time() >= deadline
+                    ):
+                        return None
+                else:
+                    self.runtime.connect_succeeded(target.name)
+                    entry.connect_successes += 1
+                    if permit is not None:
+                        await entry.circuit.record_success(permit)
+                        resolved = True
+                    connected = _BackendConnection(
+                        decision, entry, reader, connected_writer, permit
+                    )
+                    transferred = True
+                    return connected
+            finally:
+                try:
+                    if writer is not None and not transferred:
+                        try:
+                            await close_stream_writer(
+                                writer,
+                                timeout_seconds=config.connection.shutdown_cancel_timeout_seconds,
+                            )
+                        finally:
+                            self._writers.discard(writer)
+                finally:
+                    if permit is not None and permit.allowed and not resolved:
+                        await entry.circuit.release(permit)
+            decision = await router.select_for_connection(
+                shutting_down=self.runtime.shutting_down, excluded=frozenset(attempted)
+            )
+        return None
+
+    async def _local_status(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        snapshot: RuntimeConfiguration,
+        state: str,
+    ) -> tuple[bool, bytes]:
+        service = snapshot.status_service
+        if not service.try_acquire():
+            self.runtime.reject(RejectionReason.GLOBAL_LIMIT)
+            return True, b""
+        try:
+            inspection = await service.inspect(reader)
+            if inspection.next_state == 1:
+                await service.respond(reader, writer, inspection, state)
+                return True, b""
+            return False, inspection.prefix
+        finally:
+            service.release()
+
     async def handle_client(
         self,
         client_reader: asyncio.StreamReader,
         client_writer: asyncio.StreamWriter,
     ) -> None:
+        token = _CONNECTION_SNAPSHOT.set(self._snapshot)
+        try:
+            await self._handle_client(client_reader, client_writer)
+        finally:
+            _CONNECTION_SNAPSHOT.reset(token)
+
+    async def _handle_client(
+        self,
+        client_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+    ) -> None:
+        snapshot = _CONNECTION_SNAPSHOT.get()
+        config = self._connection_config()
+        router = snapshot.router if snapshot is not None else self.router
+        registry = router.registry
+        entry: BackendRuntime | None = None
+        prefix = b""
+        status_inspected = False
         peer = _endpoint(client_writer.get_extra_info("peername"))
         peer_ip = peer[0] if peer is not None else "unknown"
         lease: ConnectionLease | None = None
@@ -291,10 +489,10 @@ class ProxyServer:
             if peer is None:
                 self.runtime.reject(RejectionReason.NO_TARGET)
                 return
-            trusted_proxy = self.config.proxy_protocol.accept and is_trusted_proxy(
+            trusted_proxy = config.proxy_protocol.accept and is_trusted_proxy(
                 peer_ip,
-                self.config.proxy_protocol.trusted_proxy_ips,
-                trust_all=self.config.proxy_protocol.trust_all_proxies,
+                config.proxy_protocol.trusted_proxy_ips,
+                trust_all=config.proxy_protocol.trust_all_proxies,
             )
             lease, rejection = await self.limiter.try_acquire(
                 peer_ip,
@@ -304,7 +502,7 @@ class ProxyServer:
                 self.runtime.reject(rejection or RejectionReason.GLOBAL_LIMIT)
                 return
             self.runtime.connection_admitted()
-            configure_tcp_writer(client_writer, keepalive=self.config.connection.tcp_keepalive)
+            configure_tcp_writer(client_writer, keepalive=config.connection.tcp_keepalive)
 
             try:
                 inbound = await self._read_inbound_proxy(client_reader, peer_ip)
@@ -341,11 +539,48 @@ class ProxyServer:
                     self.runtime.reject(rejection)
                     return
 
-            decision = await self.router.select_for_connection(
-                shutting_down=self.runtime.shutting_down
+            preview = router.snapshot(shutting_down=self.runtime.shutting_down)
+            status_policy = config.status.enabled and (
+                not preview.ready
+                or config.status.always
+                or (
+                    config.status.maintenance
+                    and preview.maintenance_mode is not MaintenanceMode.AUTO
+                )
             )
-            permit = decision.circuit_permit
+            if status_policy and snapshot is not None:
+                status_inspected = True
+                preferred = next((item for item in registry.ordered if item.config.enabled), None)
+                state = (
+                    "maintenance"
+                    if preview.maintenance_mode is not MaintenanceMode.AUTO
+                    else "offline"
+                    if not preview.ready
+                    else "fallback"
+                    if preferred is not None and preview.backend_id != preferred.config.id
+                    else "online"
+                )
+                handled, prefix = await self._local_status(
+                    client_reader, client_writer, snapshot, state
+                )
+                if handled:
+                    return
+
+            decision = await router.select_for_connection(shutting_down=self.runtime.shutting_down)
             if decision.target is None:
+                if (
+                    config.status.enabled
+                    and snapshot is not None
+                    and not status_inspected
+                    and not self.runtime.shutting_down
+                ):
+                    mode = snapshot.maintenance.snapshot.mode
+                    state = "offline" if mode is MaintenanceMode.AUTO else "maintenance"
+                    handled, _prefix = await self._local_status(
+                        client_reader, client_writer, snapshot, state
+                    )
+                    if handled:
+                        return
                 reason = (
                     RejectionReason.SHUTTING_DOWN
                     if self.runtime.shutting_down
@@ -354,67 +589,87 @@ class ProxyServer:
                 self.runtime.reject(reason)
                 return
 
-            target = decision.target
-            try:
-                server_reader, server_writer = await self._connect(target, inbound, client_writer)
-            except asyncio.CancelledError:
-                raise
-            except (asyncio.TimeoutError, ConnectionError, OSError) as exc:
-                self.runtime.connect_failed(target.name)
-                log.warning(
-                    "Upstream connect failed target=%s host=%s port=%s error=%s",
-                    target.name.value,
-                    target.host,
-                    target.port,
-                    type(exc).__name__,
-                )
-                if target.name is TargetName.MAIN and permit is not None:
-                    await self.circuit_breaker.record_failure(permit)
-                    permit_resolved = True
-                    fallback_result = await self._fallback_after_main_failure(
-                        decision, inbound, client_writer
+            connected = await self._connect_candidates(decision, router, inbound, client_writer)
+            if connected is None:
+                if config.status.enabled and snapshot is not None and not status_inspected:
+                    mode = snapshot.maintenance.snapshot.mode
+                    state = "offline" if mode is MaintenanceMode.AUTO else "maintenance"
+                    handled, _prefix = await self._local_status(
+                        client_reader, client_writer, snapshot, state
                     )
-                    if fallback_result is None:
-                        self.runtime.reject(RejectionReason.BACKEND_CONNECT_FAILED)
+                    if handled:
                         return
-                    target, server_reader, server_writer = fallback_result
-                else:
-                    self.runtime.reject(RejectionReason.BACKEND_CONNECT_FAILED)
-                    return
-            else:
-                self.runtime.connect_succeeded(target.name)
-                self.runtime.backend_connection_started()
-                backend_started = True
-                if target.name is TargetName.MAIN and permit is not None:
-                    await self.circuit_breaker.record_success(permit)
-                    permit_resolved = True
-
+                self.runtime.reject(RejectionReason.BACKEND_CONNECT_FAILED)
+                return
+            decision = connected.decision
+            entry = connected.entry
+            target = entry.target
+            server_reader, server_writer = connected.reader, connected.writer
+            permit, permit_resolved = connected.permit, True
             if not backend_started:
                 self.runtime.backend_connection_started()
                 backend_started = True
-            if self.config.logging.access_log:
+            if entry is not None:
+                entry.active_connections += 1
+            if prefix:
+                try:
+                    server_writer.write(prefix)
+                    await asyncio.wait_for(
+                        server_writer.drain(), timeout=config.connection.write_timeout_seconds
+                    )
+                except asyncio.TimeoutError:
+                    if entry is not None and registry is not None:
+                        registry.request_check(entry.config.id)
+                    return
+                except (ConnectionError, OSError) as exc:
+                    outcome = classify_relay_result(
+                        (_error_result("client_to_server", PipeEnd.WRITE_ERROR, 0, exc),),
+                        duration_seconds=0,
+                    )
+                    if outcome.backend_failure and config.passive_health.enabled:
+                        registry.record_passive_failure(entry.config.id, outcome.kind.value)
+                        await entry.circuit.record_session_failure(permit)
+                    elif outcome.confirm_health:
+                        registry.request_check(entry.config.id)
+                    return
+            if config.logging.access_log:
                 log.info(
                     "Connection opened peer=%s target=%s reason=%s",
                     lease.peer_ip or peer_ip,
-                    target.name.value,
+                    target.backend_id or target.name.value,
                     (
                         RoutingReason.MAIN_CONNECT_FAILED_FALLBACK.value
                         if target.name is TargetName.FALLBACK
+                        and decision.target is not None
                         and decision.target.name is TargetName.MAIN
                         else decision.reason.value
                     ),
                 )
-            await relay_streams(
+            relay_started = self.runtime.clock.monotonic()
+            results = await relay_streams(
                 client_reader,
                 client_writer,
                 server_reader,
                 server_writer,
-                buffer_size=self.config.connection.buffer_size,
-                idle_timeout_seconds=self.config.connection.idle_timeout_seconds,
-                write_timeout_seconds=self.config.connection.write_timeout_seconds,
-                drain_timeout_seconds=self.config.connection.relay_drain_timeout_seconds,
+                buffer_size=config.connection.buffer_size,
+                idle_timeout_seconds=config.connection.idle_timeout_seconds,
+                write_timeout_seconds=config.connection.write_timeout_seconds,
+                drain_timeout_seconds=config.connection.relay_drain_timeout_seconds,
                 clock=self.runtime.clock,
             )
+            if entry is not None and registry is not None:
+                outcome = classify_relay_result(
+                    results,
+                    duration_seconds=max(0.0, self.runtime.clock.monotonic() - relay_started),
+                    early_session_seconds=config.passive_health.early_session_seconds,
+                    shutting_down=self.runtime.shutting_down,
+                )
+                if outcome.backend_failure:
+                    registry.record_passive_failure(entry.config.id, outcome.kind.value)
+                    if config.passive_health.enabled:
+                        await entry.circuit.record_session_failure(permit)
+                elif outcome.confirm_health:
+                    registry.request_check(entry.config.id)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -426,10 +681,13 @@ class ProxyServer:
             # active gauge.
             if backend_started:
                 self.runtime.backend_connection_finished()
+                if entry is not None:
+                    entry.active_connections = max(0, entry.active_connections - 1)
             cleanup_cancelled: asyncio.CancelledError | None = None
             if permit is not None and permit.allowed and not permit_resolved:
                 try:
-                    await self.circuit_breaker.release(permit)
+                    breaker = entry.circuit if entry is not None else self.circuit_breaker
+                    await breaker.release(permit)
                 except asyncio.CancelledError as exc:
                     cleanup_cancelled = exc
                 except Exception:
@@ -438,11 +696,11 @@ class ProxyServer:
                 close_results = await asyncio.gather(
                     close_stream_writer(
                         server_writer,
-                        timeout_seconds=self.config.connection.shutdown_cancel_timeout_seconds,
+                        timeout_seconds=config.connection.shutdown_cancel_timeout_seconds,
                     ),
                     close_stream_writer(
                         client_writer,
-                        timeout_seconds=self.config.connection.shutdown_cancel_timeout_seconds,
+                        timeout_seconds=config.connection.shutdown_cancel_timeout_seconds,
                     ),
                     return_exceptions=True,
                 )
@@ -464,7 +722,7 @@ class ProxyServer:
                     cleanup_cancelled = cleanup_cancelled or exc
                 except Exception:
                     log.exception("Unexpected connection-limiter cleanup failure")
-            if self.config.logging.access_log:
+            if config.logging.access_log:
                 log.info("Connection closed peer=%s", lease.peer_ip if lease else peer_ip)
             if cleanup_cancelled is not None:
                 raise cleanup_cancelled

@@ -132,12 +132,16 @@ class CircuitBreaker:
         self._lock = asyncio.Lock()
         self._state = CircuitState.CLOSED
         self._failures: deque[float] = deque()
+        # An accepted TCP socket does not disprove earlier established-session
+        # failures. Keep that evidence separate from connect-attempt successes.
+        self._session_failures: deque[float] = deque()
         self._opened_at: datetime | None = None
         self._open_deadline: float | None = None
         self._open_total = 0
         self._generation = 0
         self._next_probe_id = 0
         self._active_probe_ids: set[int] = set()
+        self._last_successful_probe_generation: int | None = None
 
     async def acquire(self) -> CircuitPermit:
         """Acquire permission for one real connection attempt."""
@@ -209,10 +213,55 @@ class CircuitBreaker:
                 if not self._consume_current_probe(permit):
                     return
                 self._close()
+                self._last_successful_probe_generation = permit._generation
                 return
 
             if self._state is CircuitState.CLOSED and permit._generation == self._generation:
                 self._failures.clear()
+
+    async def record_session_failure(self, permit: CircuitPermit | None = None) -> None:
+        """Record fresh, typed backend I/O evidence after TCP establishment.
+
+        The bounded history survives ordinary connect successes. A failed
+        recovery probe immediately reopens the circuit, including a reset just
+        after its TCP success closed the circuit. Older generations cannot undo
+        a subsequent recovery or extend an already open cooldown.
+        """
+
+        async with self._lock:
+            if not self.enabled or (permit is not None and not permit.allowed):
+                return
+            now = self._clock.monotonic()
+            self._prune_failures(now)
+            if self._state is CircuitState.OPEN:
+                return
+            failed_probe = False
+            if permit is not None and permit.probe:
+                if self._state is CircuitState.HALF_OPEN:
+                    if not self._consume_current_probe(permit):
+                        return
+                    failed_probe = True
+                elif (
+                    permit._generation is not None
+                    and self._last_successful_probe_generation == permit._generation
+                    and self._generation == permit._generation + 1
+                ):
+                    failed_probe = True
+                else:
+                    return
+            elif (
+                permit is not None
+                and permit._generation is not None
+                and permit._generation != self._generation
+            ):
+                return
+            if len(self._session_failures) < self.failure_threshold:
+                self._session_failures.append(now)
+            if (
+                failed_probe
+                or len(self._session_failures) + len(self._failures) >= self.failure_threshold
+            ):
+                self._open(now)
 
     async def release(self, permit: CircuitPermit) -> None:
         """Release an unresolved/cancelled half-open probe without a verdict."""
@@ -274,7 +323,9 @@ class CircuitBreaker:
             state=self._state,
             opened_at=self._opened_at,
             retry_after_seconds=retry_after,
-            failures_in_window=len(self._failures),
+            failures_in_window=min(
+                self.failure_threshold, len(self._failures) + len(self._session_failures)
+            ),
             half_open_in_flight=len(self._active_probe_ids),
             open_total=self._open_total,
         )
@@ -283,6 +334,8 @@ class CircuitBreaker:
         oldest_allowed = now - self.failure_window_seconds
         while self._failures and self._failures[0] < oldest_allowed:
             self._failures.popleft()
+        while self._session_failures and self._session_failures[0] < oldest_allowed:
+            self._session_failures.popleft()
 
     def _consume_current_probe(self, permit: CircuitPermit) -> bool:
         if (
@@ -302,11 +355,14 @@ class CircuitBreaker:
         self._open_total += 1
         self._generation += 1
         self._active_probe_ids.clear()
+        self._last_successful_probe_generation = None
 
     def _close(self) -> None:
         self._state = CircuitState.CLOSED
         self._opened_at = None
         self._open_deadline = None
         self._failures.clear()
+        self._session_failures.clear()
         self._generation += 1
         self._active_probe_ids.clear()
+        self._last_successful_probe_generation = None

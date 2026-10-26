@@ -1,0 +1,99 @@
+{
+  "python": "3.13.15",
+  "platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.43",
+  "parameters": {
+    "clients": 100,
+    "rounds": 5,
+    "reloads": 10,
+    "payload_bytes": 64,
+    "output": "/home/leo/Downloads/REPOs/Minecraft-Python-Failover-Proxy/docs/feature-validation/final-clients-100.json",
+    "backend_hostname": false
+  },
+  "errors": 0,
+  "baseline": {
+    "tasks": 4,
+    "fds": 12,
+    "sockets": 7,
+    "rss_kib": 28844
+  },
+  "connect": {
+    "p50_ms": 70.79877700016368,
+    "p95_ms": 74.20448399989255,
+    "p99_ms": 74.4862790006664,
+    "wall_seconds": 0.07529992300078447,
+    "cpu_seconds": 0.054960800000000004,
+    "tasks": 413,
+    "fds": 416,
+    "sockets": 411,
+    "rss_kib": 32200
+  },
+  "relay": {
+    "p50_ms": 9.061825999197026,
+    "p95_ms": 12.288421999983257,
+    "p99_ms": 12.62251699972694,
+    "roundtrips": 500,
+    "wall_seconds": 0.0531742729999678,
+    "cpu_seconds": 0.053161032000000025,
+    "duplex_mib_per_second": 1.1478324536761784
+  },
+  "status": {
+    "p50_ms": 48.17868800000724,
+    "p95_ms": 50.721005000013974,
+    "p99_ms": 50.950079999893205,
+    "count": 100,
+    "wall_seconds": 0.060022625999408774,
+    "cpu_seconds": 0.052352286000000026,
+    "tasks": 409,
+    "fds": 412,
+    "sockets": 407,
+    "rss_kib": 33732
+  },
+  "reload_under_load": {
+    "p50_ms": 11.358455999470607,
+    "p95_ms": 13.422836000245297,
+    "p99_ms": 13.422836000245297,
+    "count": 10,
+    "generation": 11,
+    "includes_held_roundtrip": true,
+    "traffic_overlaps_reload": true,
+    "wall_seconds": 0.1669011080002747,
+    "cpu_seconds": 0.12070719800000002,
+    "before": {
+      "tasks": 409,
+      "fds": 412,
+      "sockets": 407,
+      "rss_kib": 33732
+    },
+    "after": {
+      "tasks": 409,
+      "fds": 412,
+      "sockets": 407,
+      "rss_kib": 33744
+    }
+  },
+  "two_backend_failures_detection_ms": 48.210838999693806,
+  "recovery_detection_ms": 43.377071000577416,
+  "after_clients": {
+    "tasks": 109,
+    "fds": 11,
+    "sockets": 6,
+    "rss_kib": 33928
+  },
+  "shutdown": {
+    "proxy_tasks": 0,
+    "background_tasks": 0,
+    "active_sessions": 0,
+    "limiter_active": 0
+  },
+  "eventloop_lag": {
+    "p50_ms": 2.1764589994199923,
+    "p95_ms": 16.823819999663097,
+    "p99_ms": 20.369793999852842
+  },
+  "final": {
+    "tasks": 1,
+    "fds": 7,
+    "sockets": 2,
+    "rss_kib": 33928
+  }
+}

@@ -29,6 +29,7 @@ class MaintenanceMode(str, Enum):
     AUTO = "auto"
     FORCE_MAIN = "force_main"
     FORCE_FALLBACK = "force_fallback"
+    FORCE_TARGET = "force_target"
 
 
 class RoutingReason(str, Enum):
@@ -43,6 +44,9 @@ class RoutingReason(str, Enum):
     FORCED_FALLBACK_UNAVAILABLE = "forced_fallback_unavailable"
     NO_TARGET_AVAILABLE = "no_target_available"
     SHUTTING_DOWN = "shutting_down"
+    BACKEND_HEALTHY = "backend_healthy"
+    FORCE_TARGET = "force_target"
+    FORCED_TARGET_UNAVAILABLE = "forced_target_unavailable"
 
 
 class RejectionReason(str, Enum):
@@ -62,6 +66,11 @@ class Target:
     name: TargetName
     host: str
     port: int
+    backend_id: str | None = None
+
+    @property
+    def id(self) -> str:
+        return self.backend_id or self.name.value
 
 
 @dataclass(frozen=True, slots=True)
