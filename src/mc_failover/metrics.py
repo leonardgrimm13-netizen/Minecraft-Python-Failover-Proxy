@@ -179,7 +179,7 @@ def render_metrics(
         )
     )
 
-    health_snapshots = (main, fallback)
+    health_snapshots = ((TargetName.MAIN, main), (TargetName.FALLBACK, fallback))
     add(
         _family(
             "mc_failover_target_health_status",
@@ -187,10 +187,10 @@ def render_metrics(
             "gauge",
             [
                 (
-                    {"target": snapshot.target.value, "status": status.value},
+                    {"target": target.value, "status": status.value},
                     int(snapshot.status is status),
                 )
-                for snapshot in health_snapshots
+                for target, snapshot in health_snapshots
                 for status in HealthStatus
             ],
         )
@@ -201,8 +201,8 @@ def render_metrics(
             "Successful active checks by target.",
             "counter",
             [
-                ({"target": snapshot.target.value}, snapshot.total_successes)
-                for snapshot in health_snapshots
+                ({"target": target.value}, snapshot.total_successes)
+                for target, snapshot in health_snapshots
             ],
         )
     )
@@ -212,14 +212,14 @@ def render_metrics(
             "Failed active checks by target.",
             "counter",
             [
-                ({"target": snapshot.target.value}, snapshot.total_failures)
-                for snapshot in health_snapshots
+                ({"target": target.value}, snapshot.total_failures)
+                for target, snapshot in health_snapshots
             ],
         )
     )
     latency_samples = [
-        ({"target": snapshot.target.value}, snapshot.last_result.latency_ms)
-        for snapshot in health_snapshots
+        ({"target": target.value}, snapshot.last_result.latency_ms)
+        for target, snapshot in health_snapshots
         if snapshot.last_result is not None and snapshot.last_result.latency_ms is not None
     ]
     add(
@@ -231,8 +231,8 @@ def render_metrics(
         )
     )
     age_samples = [
-        ({"target": snapshot.target.value}, snapshot.seconds_since_last_check)
-        for snapshot in health_snapshots
+        ({"target": target.value}, snapshot.seconds_since_last_check)
+        for target, snapshot in health_snapshots
         if snapshot.seconds_since_last_check is not None
     ]
     add(
@@ -244,8 +244,8 @@ def render_metrics(
         )
     )
     timestamp_samples = [
-        ({"target": snapshot.target.value}, snapshot.last_check_at.timestamp())
-        for snapshot in health_snapshots
+        ({"target": target.value}, snapshot.last_check_at.timestamp())
+        for target, snapshot in health_snapshots
         if snapshot.last_check_at is not None
     ]
     add(
@@ -300,4 +300,188 @@ def render_metrics(
             [({"reason": decision.reason.value}, 1)],
         )
     )
+    for name, help_text, metric_type, value in (
+        (
+            "config_generation",
+            "Active validated configuration generation.",
+            "gauge",
+            runtime.config_generation,
+        ),
+        (
+            "config_reload_successes_total",
+            "Successfully activated configurations.",
+            "counter",
+            runtime.reload_successes,
+        ),
+        (
+            "config_reload_failures_total",
+            "Configuration reload attempts rejected before activation.",
+            "counter",
+            runtime.reload_failures,
+        ),
+        (
+            "config_last_reload_timestamp_seconds",
+            "UTC Unix timestamp of the last successful configuration reload; zero before any reload.",
+            "gauge",
+            runtime.last_reload_at.timestamp() if runtime.last_reload_at is not None else 0,
+        ),
+    ):
+        add(_family(f"mc_failover_{name}", help_text, metric_type, [({}, value)]))
+    entries = router.registry.ordered
+    snapshots = {entry.config.id: entry.health.snapshot() for entry in entries}
+    circuits = {entry.config.id: entry.circuit.snapshot_now() for entry in entries}
+    for name, help_text, metric_type, samples in (
+        (
+            "enabled",
+            "Whether the configured backend is enabled.",
+            "gauge",
+            [({"backend": entry.config.id}, int(entry.config.enabled)) for entry in entries],
+        ),
+        (
+            "priority",
+            "Configured routing priority; lower values are preferred.",
+            "gauge",
+            [({"backend": entry.config.id}, entry.config.priority) for entry in entries],
+        ),
+        (
+            "selected",
+            "Whether the backend is selected for new connections.",
+            "gauge",
+            [
+                ({"backend": entry.config.id}, int(decision.backend_id == entry.config.id))
+                for entry in entries
+            ],
+        ),
+        (
+            "routable",
+            "Whether active/passive health and the circuit allow ordinary routing.",
+            "gauge",
+            [
+                (
+                    {"backend": entry.config.id},
+                    int(entry.routable and circuits[entry.config.id].state is CircuitState.CLOSED),
+                )
+                for entry in entries
+            ],
+        ),
+        (
+            "active_connections",
+            "Current established sessions for the configured backend.",
+            "gauge",
+            [({"backend": entry.config.id}, entry.active_connections) for entry in entries],
+        ),
+        (
+            "connect_failures_total",
+            "Failed real connection attempts for the backend.",
+            "counter",
+            [({"backend": entry.config.id}, entry.connect_failures) for entry in entries],
+        ),
+        (
+            "connect_successes_total",
+            "Successful prepared real connections for the backend.",
+            "counter",
+            [({"backend": entry.config.id}, entry.connect_successes) for entry in entries],
+        ),
+        (
+            "passive_failures_total",
+            "Backend session failures supported by I/O or health evidence.",
+            "counter",
+            [({"backend": entry.config.id}, entry.passive_failures) for entry in entries],
+        ),
+        (
+            "passive_failures_in_window",
+            "Bounded count of passive failures in the current window.",
+            "gauge",
+            [({"backend": entry.config.id}, entry.passive_failures_in_window) for entry in entries],
+        ),
+        (
+            "quarantine_remaining_seconds",
+            "Minimum remaining passive quarantine duration.",
+            "gauge",
+            [
+                ({"backend": entry.config.id}, entry.quarantine_remaining_seconds)
+                for entry in entries
+            ],
+        ),
+        (
+            "healthcheck_successes_total",
+            "Successful active checks for the backend.",
+            "counter",
+            [
+                ({"backend": entry.config.id}, snapshots[entry.config.id].total_successes)
+                for entry in entries
+            ],
+        ),
+        (
+            "healthcheck_failures_total",
+            "Failed active checks for the backend.",
+            "counter",
+            [
+                ({"backend": entry.config.id}, snapshots[entry.config.id].total_failures)
+                for entry in entries
+            ],
+        ),
+        (
+            "health_status",
+            "One-hot health status for configured backend IDs.",
+            "gauge",
+            [
+                (
+                    {"backend": entry.config.id, "status": status.value},
+                    int(snapshots[entry.config.id].status is status),
+                )
+                for entry in entries
+                for status in HealthStatus
+            ],
+        ),
+        (
+            "healthcheck_latency_milliseconds",
+            "Latest completed backend check latency.",
+            "gauge",
+            [
+                ({"backend": backend_id}, snapshot.last_result.latency_ms)
+                for backend_id, snapshot in snapshots.items()
+                if snapshot.last_result is not None and snapshot.last_result.latency_ms is not None
+            ],
+        ),
+        (
+            "healthcheck_age_seconds",
+            "Monotonic age of the latest completed backend check.",
+            "gauge",
+            [
+                ({"backend": backend_id}, snapshot.seconds_since_last_check)
+                for backend_id, snapshot in snapshots.items()
+                if snapshot.seconds_since_last_check is not None
+            ],
+        ),
+        (
+            "circuit_breaker_state",
+            "One-hot circuit state for configured backend IDs.",
+            "gauge",
+            [
+                ({"backend": backend_id, "state": state.value}, int(snapshot.state is state))
+                for backend_id, snapshot in circuits.items()
+                for state in CircuitState
+            ],
+        ),
+        (
+            "circuit_breaker_open_total",
+            "Backend circuit transitions to open.",
+            "counter",
+            [
+                ({"backend": backend_id}, snapshot.open_total)
+                for backend_id, snapshot in circuits.items()
+            ],
+        ),
+        (
+            "circuit_breaker_retry_after_seconds",
+            "Seconds until the backend permits a recovery probe.",
+            "gauge",
+            [
+                ({"backend": backend_id}, snapshot.retry_after_seconds)
+                for backend_id, snapshot in circuits.items()
+            ],
+        ),
+    ):
+        add(_family(f"mc_failover_backend_{name}", help_text, metric_type, samples))
     return "\n".join(lines) + "\n"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import socket
 from dataclasses import dataclass
@@ -20,12 +21,163 @@ class PipeEnd(str, Enum):
     WRITE_ERROR = "write_error"
 
 
+class RelayErrorKind(str, Enum):
+    """Socket evidence, captured before exceptions leave the data path."""
+
+    RESET = "reset"
+    BROKEN_PIPE = "broken_pipe"
+    NETWORK = "network"
+    TIMEOUT = "timeout"
+    OTHER_IO = "other_io"
+
+
+class RelayEndpoint(str, Enum):
+    CLIENT = "client"
+    BACKEND = "backend"
+    UNKNOWN = "unknown"
+
+
+class RelayOutcomeKind(str, Enum):
+    EOF = "eof"
+    CLIENT_DISCONNECT = "client_disconnect"
+    BACKEND_RESET = "backend_reset"
+    BACKEND_IO_ERROR = "backend_io_error"
+    AMBIGUOUS = "ambiguous"
+    EARLY_BACKEND_END = "early_backend_end"
+    IDLE_TIMEOUT = "idle_timeout"
+    SHUTDOWN = "shutdown"
+    CANCELLED = "cancelled"
+
+
 @dataclass(frozen=True, slots=True)
 class PipeResult:
     direction: str
     end: PipeEnd
     bytes_forwarded: int
     error_type: str | None = None
+    error_kind: RelayErrorKind | None = None
+    error_errno: int | None = None
+    eof_propagation: bool = False
+
+    @property
+    def error_endpoint(self) -> RelayEndpoint:
+        if self.end not in {PipeEnd.READ_ERROR, PipeEnd.WRITE_ERROR}:
+            return RelayEndpoint.UNKNOWN
+        if self.direction == "client_to_server":
+            return RelayEndpoint.CLIENT if self.end is PipeEnd.READ_ERROR else RelayEndpoint.BACKEND
+        if self.direction == "server_to_client":
+            return RelayEndpoint.BACKEND if self.end is PipeEnd.READ_ERROR else RelayEndpoint.CLIENT
+        return RelayEndpoint.UNKNOWN
+
+
+@dataclass(frozen=True, slots=True)
+class RelayOutcome:
+    kind: RelayOutcomeKind
+    backend_failure: bool = False
+    confirm_health: bool = False
+    early: bool = False
+
+
+def _error_result(
+    direction: str,
+    end: PipeEnd,
+    forwarded: int,
+    error: BaseException,
+    *,
+    eof_propagation: bool = False,
+) -> PipeResult:
+    if isinstance(error, (asyncio.TimeoutError, TimeoutError)):
+        kind = RelayErrorKind.TIMEOUT
+    elif isinstance(error, ConnectionResetError):
+        kind = RelayErrorKind.RESET
+    elif isinstance(error, BrokenPipeError):
+        kind = RelayErrorKind.BROKEN_PIPE
+    elif isinstance(error, ConnectionError) or (
+        isinstance(error, OSError)
+        and error.errno
+        in {
+            errno.ECONNABORTED,
+            errno.ECONNREFUSED,
+            errno.EHOSTUNREACH,
+            errno.ENETDOWN,
+            errno.ENETUNREACH,
+            errno.ENOTCONN,
+            errno.ETIMEDOUT,
+        }
+    ):
+        kind = RelayErrorKind.NETWORK
+    else:
+        kind = RelayErrorKind.OTHER_IO
+    return PipeResult(
+        direction,
+        end,
+        forwarded,
+        type(error).__name__,
+        kind,
+        error.errno if isinstance(error, OSError) else None,
+        eof_propagation,
+    )
+
+
+def classify_relay_result(
+    results: tuple[PipeResult, ...],
+    *,
+    duration_seconds: float,
+    early_session_seconds: float = 0.0,
+    shutting_down: bool = False,
+    cancelled: bool = False,
+) -> RelayOutcome:
+    """Attribute errors by the socket operation, never by exception messages.
+
+    EOF and inactivity are normal. A short backend EOF without any response
+    merely requests an active health confirmation when explicitly enabled.
+    Failed half-close propagation and write deadlines are also ambiguous.
+    """
+
+    early = early_session_seconds > 0 and duration_seconds <= early_session_seconds
+    if shutting_down:
+        return RelayOutcome(RelayOutcomeKind.SHUTDOWN, early=early)
+    if cancelled:
+        return RelayOutcome(RelayOutcomeKind.CANCELLED, early=early)
+    client_errors: list[PipeResult] = []
+    backend_errors: list[PipeResult] = []
+    for result in results:
+        if result.end not in {PipeEnd.READ_ERROR, PipeEnd.WRITE_ERROR}:
+            continue
+        (
+            backend_errors if result.error_endpoint is RelayEndpoint.BACKEND else client_errors
+        ).append(result)
+    # A client abort can cause a failed write_eof to the backend as cleanup.
+    direct_backend_errors = [result for result in backend_errors if not result.eof_propagation]
+    if direct_backend_errors:
+        if any(result.error_kind is RelayErrorKind.RESET for result in direct_backend_errors):
+            return RelayOutcome(RelayOutcomeKind.BACKEND_RESET, True, early=early)
+        if any(
+            result.error_kind in {RelayErrorKind.NETWORK, RelayErrorKind.BROKEN_PIPE}
+            for result in direct_backend_errors
+        ):
+            return RelayOutcome(RelayOutcomeKind.BACKEND_IO_ERROR, True, early=early)
+    if client_errors:
+        return RelayOutcome(RelayOutcomeKind.CLIENT_DISCONNECT, early=early)
+    if backend_errors:
+        return RelayOutcome(RelayOutcomeKind.AMBIGUOUS, confirm_health=True, early=early)
+    if any(result.end is PipeEnd.IDLE_TIMEOUT for result in results):
+        return RelayOutcome(RelayOutcomeKind.IDLE_TIMEOUT, early=early)
+    if (
+        early
+        and any(
+            result.direction == "server_to_client"
+            and result.end is PipeEnd.EOF
+            and result.bytes_forwarded == 0
+            for result in results
+        )
+        and not any(
+            result.direction == "client_to_server" and result.end is PipeEnd.EOF
+            for result in results
+        )
+    ):
+        return RelayOutcome(RelayOutcomeKind.EARLY_BACKEND_END, confirm_health=True, early=True)
+    return RelayOutcome(RelayOutcomeKind.EOF, early=early)
 
 
 @dataclass(slots=True)
@@ -133,7 +285,7 @@ async def pipe(
         except asyncio.CancelledError:
             raise
         except (ConnectionResetError, BrokenPipeError, ConnectionError, OSError) as exc:
-            return PipeResult(direction, PipeEnd.READ_ERROR, forwarded, type(exc).__name__)
+            return _error_result(direction, PipeEnd.READ_ERROR, forwarded, exc)
 
         if not data:
             try:
@@ -144,7 +296,9 @@ async def pipe(
             except asyncio.CancelledError:
                 raise
             except (asyncio.TimeoutError, ConnectionError, OSError) as exc:
-                return PipeResult(direction, PipeEnd.WRITE_ERROR, forwarded, type(exc).__name__)
+                return _error_result(
+                    direction, PipeEnd.WRITE_ERROR, forwarded, exc, eof_propagation=True
+                )
             return PipeResult(direction, PipeEnd.EOF, forwarded)
 
         activity.touch()
@@ -162,7 +316,7 @@ async def pipe(
         except asyncio.CancelledError:
             raise
         except (asyncio.TimeoutError, ConnectionResetError, BrokenPipeError, OSError) as exc:
-            return PipeResult(direction, PipeEnd.WRITE_ERROR, forwarded, type(exc).__name__)
+            return _error_result(direction, PipeEnd.WRITE_ERROR, forwarded, exc)
         forwarded += len(data)
         activity.touch()
 

@@ -17,7 +17,7 @@ from .config import AppConfig
 from .endpoint_safety import EndpointLoopGuard, sockaddr_host
 from .health import HealthSnapshot, HealthState
 from .metrics import render_metrics
-from .models import RejectionReason
+from .models import CircuitState, RejectionReason
 from .routing import Router
 from .runtime import RuntimeState, TaskTracker
 from .time_utils import format_utc
@@ -269,12 +269,53 @@ def build_monitoring_payload(
             "open_total": circuit.open_total,
         },
         "shutting_down": runtime.shutting_down,
+        "configuration": {
+            "generation": runtime.config_generation,
+            "reload_successes": runtime.reload_successes,
+            "reload_failures": runtime.reload_failures,
+            "last_reload_at": format_utc(runtime.last_reload_at),
+            "last_reload_result": runtime.last_reload_result,
+        },
     }
+    registry = router.registry
+    payload["selected_backend"] = decision.backend_id
+    payload["backends"] = {}
+    for entry in registry.ordered:
+        backend_circuit = entry.circuit.snapshot_now()
+        payload["backends"][entry.config.id] = {
+            **_health_payload(entry.health.snapshot()),
+            "id": entry.config.id,
+            "enabled": entry.config.enabled,
+            "priority": entry.config.priority,
+            "selected": decision.backend_id == entry.config.id,
+            "routable": entry.routable and backend_circuit.state is CircuitState.CLOSED,
+            "active_connections": entry.active_connections,
+            "connect_failures_total": entry.connect_failures,
+            "connect_successes_total": entry.connect_successes,
+            "passive_failures_total": entry.passive_failures,
+            "passive_failures_in_window": entry.passive_failures_in_window,
+            "quarantine_remaining_seconds": entry.quarantine_remaining_seconds,
+            "circuit_breaker": {
+                "enabled": entry.config.circuit_breaker.enabled,
+                "state": backend_circuit.state.value,
+                "opened_at": format_utc(backend_circuit.opened_at),
+                "retry_after_seconds": backend_circuit.retry_after_seconds,
+                "failures_in_window": backend_circuit.failures_in_window,
+                "half_open_in_flight": backend_circuit.half_open_in_flight,
+                "open_total": backend_circuit.open_total,
+            },
+        }
     if include_sensitive:
         payload["targets"] = {
-            "main": {"host": config.main.host, "port": config.main.port},
-            "fallback": {"host": config.fallback.host, "port": config.fallback.port},
+            backend.id: {"host": backend.host, "port": backend.port}
+            for backend in config.effective_backends
         }
+        # Keep the legacy lowercase aliases when the legacy schema is in use.
+        if not config.backends:
+            payload["targets"] = {
+                "main": {"host": config.main.host, "port": config.main.port},
+                "fallback": {"host": config.fallback.host, "port": config.fallback.port},
+            }
     return payload
 
 
@@ -300,6 +341,24 @@ class MonitoringServer:
         self.tasks = TaskTracker(name="monitoring-client")
         self._active = 0
         self._writers: set[asyncio.StreamWriter] = set()
+
+    def reconfigure(
+        self,
+        config: AppConfig,
+        main_health: HealthState,
+        fallback_health: HealthState,
+        circuit_breaker: CircuitBreaker,
+        router: Router,
+        endpoint_guard: EndpointLoopGuard,
+    ) -> None:
+        """Swap monitoring references in the caller's atomic activation section."""
+
+        self.config = config
+        self.main_health = main_health
+        self.fallback_health = fallback_health
+        self.circuit_breaker = circuit_breaker
+        self.router = router
+        self.endpoint_guard = endpoint_guard
 
     def _client_finished(self, writer: asyncio.StreamWriter) -> None:
         if writer in self._writers:
@@ -386,6 +445,9 @@ class MonitoringServer:
                     "main_healthy": full["main_healthy"],
                     "fallback_healthy": full["fallback_healthy"],
                     "routing_reason": full["routing_reason"],
+                    "selected_backend": full["selected_backend"],
+                    "backends": full["backends"],
+                    "configuration": full["configuration"],
                 },
             )
         if request.path == "/health":

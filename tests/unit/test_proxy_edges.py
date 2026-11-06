@@ -316,7 +316,7 @@ async def test_connect_sends_proxy_header_and_cleans_up_write_failure(
     async def open_success(*_args: object, **_kwargs: object):
         return upstream_reader, stream_writer(upstream_writer)
 
-    monkeypatch.setattr(asyncio, "open_connection", open_success)
+    monkeypatch.setattr(harness.proxy.endpoint_guard, "open_connection", open_success)
     target = Target(TargetName.MAIN, "example.invalid", 25565)
     returned_reader, returned_writer = await harness.proxy._connect(
         target, None, stream_writer(FakeWriter())
@@ -331,7 +331,7 @@ async def test_connect_sends_proxy_header_and_cleans_up_write_failure(
     async def open_failing(*_args: object, **_kwargs: object):
         return asyncio.StreamReader(), stream_writer(failing_writer)
 
-    monkeypatch.setattr(asyncio, "open_connection", open_failing)
+    monkeypatch.setattr(harness.proxy.endpoint_guard, "open_connection", open_failing)
     with pytest.raises(BrokenPipeError):
         await harness.proxy._connect(target, None, stream_writer(FakeWriter()))
     assert failing_writer.closed

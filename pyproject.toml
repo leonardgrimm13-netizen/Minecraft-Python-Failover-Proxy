@@ -61,6 +61,7 @@ include = [
   "/packaging",
   "/mc_failover_proxy.py",
   "/config.example.toml",
+  "/config.multi.example.toml",
   "/.dockerignore",
   "/Dockerfile",
   "/docker-compose.yml",
@@ -72,6 +73,7 @@ include = [
   "/requirements-dev.txt",
   "/tools/check_release_archives.py",
   "/tools/benchmark_proxy.py",
+  "/tools/benchmark_features.py",
   "/docs",
 ]
 

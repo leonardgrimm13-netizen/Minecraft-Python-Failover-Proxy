@@ -1,0 +1,168 @@
+# Multi-backend alternative to config.example.toml. Do not combine [[backends]]
+# with legacy [main], [fallback], [healthcheck] or [fallback_healthcheck].
+# Lower priority is preferred; equal priorities preserve declaration order.
+[config]
+strict_unknown_keys = true
+
+[proxy]
+listen_host = "0.0.0.0"
+listen_port = 25565
+backlog = 256
+
+[connection]
+timeout_seconds = 3.0
+buffer_size = 65536
+idle_timeout_seconds = 300.0
+write_timeout_seconds = 30.0
+relay_drain_timeout_seconds = 10.0
+shutdown_grace_seconds = 30.0
+shutdown_cancel_timeout_seconds = 5.0
+max_connections = 4096
+max_connections_per_ip = 0
+new_connections_per_second = 0.0
+new_connections_burst = 0
+tcp_keepalive = false
+
+[routing]
+max_connect_attempts = 4
+connect_budget_seconds = 8.0
+max_parallel_healthchecks = 4
+
+[circuit_breaker]
+enabled = true
+failure_threshold = 3
+failure_window_seconds = 10.0
+open_seconds = 15.0
+half_open_max_attempts = 1
+
+[passive_health]
+enabled = true
+failure_threshold = 3
+failure_window_seconds = 30.0
+quarantine_seconds = 10.0
+early_session_seconds = 2.0
+
+[maintenance]
+mode = "auto"
+# mode = "force_target" requires force_target = "FALLBACK_2".
+force_main_file = ""
+force_fallback_file = ""
+file_check_interval_seconds = 1.0
+
+[status]
+enabled = true
+always = true
+maintenance = true
+handshake_timeout_seconds = 2.0
+session_timeout_seconds = 5.0
+max_handshake_bytes = 2048
+max_concurrent = 64
+motd_online = "§aMinecraft network online"
+motd_maintenance = "§eMaintenance\nPlease try again later."
+motd_fallback = "§eMain server offline\nA fallback server is available."
+motd_offline = "§cServer temporarily offline\nPlease try again later."
+version_name = "Network status"
+protocol_version = -1
+dynamic_hint = true
+# Player counts are omitted unless both truthful values are configured.
+# players_online = 0
+# players_max = 100
+# favicon = "data:image/png;base64,..."
+
+[reload]
+enabled = true
+
+[proxy_protocol]
+accept = false
+send = false
+version = 1
+trust_all_proxies = false
+trusted_proxy_ips = []
+header_timeout_seconds = 2.0
+max_header_bytes = 4096
+
+[monitoring]
+enabled = true
+listen_host = "127.0.0.1"
+listen_port = 8080
+allow_remote = false
+bearer_token = ""
+allow_unauthenticated_remote = false
+expose_sensitive_state = false
+max_connections = 128
+request_timeout_seconds = 2.0
+write_timeout_seconds = 2.0
+
+[logging]
+level = "INFO"
+access_log = false
+
+[[backends]]
+id = "MAIN"
+host = "127.0.0.1"
+port = 25564
+priority = 0
+enabled = true
+connect_timeout_seconds = 2.0
+[backends.healthcheck]
+mode = "minecraft_status"
+interval_seconds = 3.0
+timeout_seconds = 1.5
+fail_after = 2
+recover_after = 3
+min_recovery_seconds = 5.0
+protocol_version = 767
+require_valid_json = true
+reject_uninitialized_protocol = true
+jitter_seconds = 0.2
+
+[[backends]]
+id = "FALLBACK_1"
+host = "127.0.0.1"
+port = 25566
+priority = 100
+enabled = true
+connect_timeout_seconds = 2.0
+[backends.healthcheck]
+mode = "tcp"
+interval_seconds = 4.0
+timeout_seconds = 1.0
+fail_after = 2
+recover_after = 2
+min_recovery_seconds = 3.0
+
+[[backends]]
+id = "FALLBACK_2"
+host = "127.0.0.1"
+port = 25567
+priority = 200
+enabled = true
+connect_timeout_seconds = 2.0
+[backends.healthcheck]
+mode = "tcp"
+interval_seconds = 5.0
+timeout_seconds = 1.0
+fail_after = 2
+recover_after = 2
+min_recovery_seconds = 3.0
+[backends.circuit_breaker]
+enabled = true
+failure_threshold = 2
+failure_window_seconds = 15.0
+open_seconds = 20.0
+half_open_max_attempts = 1
+
+[[backends]]
+id = "FALLBACK_3"
+host = "127.0.0.1"
+port = 25568
+priority = 300
+enabled = true
+connect_timeout_seconds = 2.0
+[backends.healthcheck]
+mode = "tcp"
+interval_seconds = 8.0
+timeout_seconds = 1.0
+fail_after = 2
+recover_after = 2
+min_recovery_seconds = 3.0

@@ -8,7 +8,7 @@ import json
 import logging
 import signal
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, is_dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -317,16 +317,40 @@ async def async_main(argv: Sequence[str] | None = None) -> int:
     ):
         logger.critical("DANGEROUS CONFIGURATION: remote monitoring has no authentication")
 
-    application = FailoverApplication(config)
+    application = FailoverApplication(config, config_path=args.config)
     loop = asyncio.get_running_loop()
     installed_signals: list[signal.Signals] = []
+    restore_sighup: Callable[[], None] | None = None
+    unsafe_sighup = False
     for caught in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(caught, application.request_shutdown)
             installed_signals.append(caught)
-        except (NotImplementedError, RuntimeError):
+        except (NotImplementedError, RuntimeError, ValueError, OSError):
             logger.warning("Signal handlers are unavailable for %s", caught.name)
+    # systemd ExecReload sends SIGHUP even when reload is disabled. Always
+    # consume it; application.request_reload uses the current runtime policy.
+    if hasattr(signal, "SIGHUP"):
+        try:
+            loop.add_signal_handler(signal.SIGHUP, application.request_reload)
+            installed_signals.append(signal.SIGHUP)
+        except (NotImplementedError, RuntimeError, ValueError, OSError):
+            logger.warning("Signal handlers are unavailable for SIGHUP; ignoring reload signals")
+            try:
+                previous_hup = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+                def restore_hup() -> None:
+                    signal.signal(signal.SIGHUP, previous_hup)
+
+                restore_sighup = restore_hup
+            except (ValueError, OSError, RuntimeError):
+                # A non-main-thread embedding may support neither API. Do not
+                # start a process that could be killed by a routine reload.
+                logger.error("Cannot install a safe SIGHUP handler; refusing startup")
+                unsafe_sighup = True
     try:
+        if unsafe_sighup:
+            return 1
         await application.run_until_stopped()
     except OSError as exc:
         logger.error("Listener startup failed error=%s", type(exc).__name__)
@@ -335,6 +359,8 @@ async def async_main(argv: Sequence[str] | None = None) -> int:
     finally:
         for caught in installed_signals:
             loop.remove_signal_handler(caught)
+        if restore_sighup is not None:
+            restore_sighup()
     return 0
 
 

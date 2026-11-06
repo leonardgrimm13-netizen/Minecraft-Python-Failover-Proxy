@@ -157,7 +157,7 @@ async def perform_health_check(
 
 @dataclass(frozen=True, slots=True)
 class HealthSnapshot:
-    target: TargetName
+    target: TargetName | str
     status: HealthStatus
     healthy: bool | None
     routable: bool
@@ -177,7 +177,7 @@ class HealthState:
 
     def __init__(
         self,
-        target: TargetName,
+        target: TargetName | str,
         config: HealthCheckConfig,
         *,
         clock: Clock = SYSTEM_CLOCK,
@@ -195,6 +195,10 @@ class HealthState:
         self.last_check_monotonic: float | None = None
         self.status_changed_at = clock.utc_now()
         self._recovery_started_monotonic: float | None = None
+
+    @property
+    def target_label(self) -> str:
+        return self.target.value if isinstance(self.target, TargetName) else self.target
 
     @property
     def healthy(self) -> bool | None:
@@ -318,7 +322,7 @@ class HealthMonitor:
         if changed:
             message = "Health state changed target=%s previous=%s status=%s reason=%s"
             arguments = (
-                self.state.target.value,
+                self.state.target_label,
                 previous_status.value,
                 self.state.status.value,
                 result.reason,
@@ -331,7 +335,7 @@ class HealthMonitor:
             log.debug(
                 "Healthcheck unsuccessful target=%s status=%s reason=%s "
                 "consecutive_failures=%s fail_after=%s",
-                self.state.target.value,
+                self.state.target_label,
                 self.state.status.value,
                 result.reason,
                 self.state.failures,
@@ -340,7 +344,7 @@ class HealthMonitor:
         elif self.state.config.log_status_details and result.ok:
             log.info(
                 "Healthcheck ok target=%s latency_ms=%s version=%s players=%s/%s motd=%s",
-                self.state.target.value,
+                self.state.target_label,
                 f"{result.latency_ms:.1f}" if result.latency_ms is not None else "n/a",
                 sanitize_log_value(result.version_name),
                 result.players_online if result.players_online is not None else "n/a",
@@ -362,7 +366,7 @@ class HealthMonitor:
                 except Exception:
                     log.exception(
                         "Unexpected health-monitor iteration failure target=%s",
-                        self.state.target.value,
+                        self.state.target_label,
                     )
             first = False
             jitter = (

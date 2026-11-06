@@ -7,7 +7,7 @@ import sys
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Protocol
+from typing import Literal, Protocol
 
 from .models import CircuitState
 from .time_utils import SYSTEM_CLOCK, Clock, as_utc
@@ -36,6 +36,14 @@ class CircuitBreakerSettings(Protocol):
     def half_open_max_attempts(self) -> int: ...
 
 
+@dataclass(slots=True)
+class _PermitVerdict:
+    # Owned by the issuing circuit's lock and retained only by its permit. This
+    # makes verdicts one-shot without an ever-growing set of connection IDs.
+    connect: Literal["success", "failure", "released"] | None = None
+    session_failed: bool = False
+
+
 @dataclass(frozen=True, slots=True)
 class CircuitPermit:
     """Immutable result of an attempt to acquire circuit capacity."""
@@ -44,6 +52,7 @@ class CircuitPermit:
     probe: bool
     _generation: int | None = field(default=None, repr=False, compare=False)
     _probe_id: int | None = field(default=None, repr=False, compare=False)
+    _verdict: _PermitVerdict = field(default_factory=_PermitVerdict, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,12 +141,16 @@ class CircuitBreaker:
         self._lock = asyncio.Lock()
         self._state = CircuitState.CLOSED
         self._failures: deque[float] = deque()
+        # An accepted TCP socket does not disprove earlier established-session
+        # failures. Keep that evidence separate from connect-attempt successes.
+        self._session_failures: deque[float] = deque()
         self._opened_at: datetime | None = None
         self._open_deadline: float | None = None
         self._open_total = 0
         self._generation = 0
         self._next_probe_id = 0
         self._active_probe_ids: set[int] = set()
+        self._last_successful_probe_generation: int | None = None
 
     async def acquire(self) -> CircuitPermit:
         """Acquire permission for one real connection attempt."""
@@ -179,13 +192,19 @@ class CircuitBreaker:
         """Record a failed attempt represented by ``permit``."""
 
         async with self._lock:
-            if not self.enabled or not permit.allowed:
+            if (
+                not self.enabled
+                or not permit.allowed
+                or permit._verdict.connect is not None
+                or permit._verdict.session_failed
+            ):
                 return
 
             now = self._clock.monotonic()
             if permit.probe:
                 if not self._consume_current_probe(permit):
                     return
+                permit._verdict.connect = "failure"
                 self._failures.append(now)
                 self._prune_failures(now)
                 self._open(now)
@@ -193,34 +212,101 @@ class CircuitBreaker:
 
             if self._state is not CircuitState.CLOSED or permit._generation != self._generation:
                 return
+            permit._verdict.connect = "failure"
             self._failures.append(now)
             self._prune_failures(now)
-            if len(self._failures) >= self.failure_threshold:
+            if self._threshold_reached():
                 self._open(now)
 
     async def record_success(self, permit: CircuitPermit) -> None:
         """Record a successful real connection and reset eligible failures."""
 
         async with self._lock:
-            if not self.enabled or not permit.allowed:
+            if (
+                not self.enabled
+                or not permit.allowed
+                or permit._verdict.connect is not None
+                or permit._verdict.session_failed
+            ):
                 return
 
             if permit.probe:
                 if not self._consume_current_probe(permit):
                     return
+                permit._verdict.connect = "success"
                 self._close()
+                self._last_successful_probe_generation = permit._generation
                 return
 
             if self._state is CircuitState.CLOSED and permit._generation == self._generation:
+                permit._verdict.connect = "success"
                 self._failures.clear()
+
+    async def record_session_failure(self, permit: CircuitPermit | None = None) -> None:
+        """Record fresh, typed backend I/O evidence after TCP establishment.
+
+        The bounded history survives ordinary connect successes. A failed
+        recovery probe immediately reopens the circuit, including a reset just
+        after its TCP success closed the circuit. Older generations cannot undo
+        a subsequent recovery or extend an already open cooldown.
+        """
+
+        async with self._lock:
+            if not self.enabled or (
+                permit is not None
+                and (
+                    not permit.allowed
+                    or permit._verdict.connect in ("failure", "released")
+                    or permit._verdict.session_failed
+                )
+            ):
+                return
+            now = self._clock.monotonic()
+            self._prune_failures(now)
+            if self._state is CircuitState.OPEN:
+                return
+            failed_probe = False
+            if permit is not None and permit.probe:
+                if self._state is CircuitState.HALF_OPEN:
+                    if not self._consume_current_probe(permit):
+                        return
+                    failed_probe = True
+                elif (
+                    permit._verdict.connect == "success"
+                    and permit._generation is not None
+                    and self._last_successful_probe_generation == permit._generation
+                    and self._generation == permit._generation + 1
+                ):
+                    failed_probe = True
+                else:
+                    return
+            elif (
+                permit is not None
+                and permit._generation is not None
+                and permit._generation != self._generation
+            ):
+                return
+            if permit is not None:
+                permit._verdict.session_failed = True
+            if len(self._session_failures) < self.failure_threshold:
+                self._session_failures.append(now)
+            if failed_probe or self._threshold_reached():
+                self._open(now)
 
     async def release(self, permit: CircuitPermit) -> None:
         """Release an unresolved/cancelled half-open probe without a verdict."""
 
         async with self._lock:
-            if not self.enabled or not permit.allowed or not permit.probe:
+            if (
+                not self.enabled
+                or not permit.allowed
+                or permit._verdict.connect is not None
+                or permit._verdict.session_failed
+            ):
                 return
-            self._consume_current_probe(permit)
+            permit._verdict.connect = "released"
+            if permit.probe:
+                self._consume_current_probe(permit)
 
     async def record_health_success(self) -> None:
         """Recover an expired open circuit using a successful active check.
@@ -274,7 +360,9 @@ class CircuitBreaker:
             state=self._state,
             opened_at=self._opened_at,
             retry_after_seconds=retry_after,
-            failures_in_window=len(self._failures),
+            failures_in_window=min(
+                self.failure_threshold, len(self._failures) + len(self._session_failures)
+            ),
             half_open_in_flight=len(self._active_probe_ids),
             open_total=self._open_total,
         )
@@ -283,6 +371,13 @@ class CircuitBreaker:
         oldest_allowed = now - self.failure_window_seconds
         while self._failures and self._failures[0] < oldest_allowed:
             self._failures.popleft()
+        while self._session_failures and self._session_failures[0] < oldest_allowed:
+            self._session_failures.popleft()
+        while len(self._failures) > self.failure_threshold:
+            self._failures.popleft()
+
+    def _threshold_reached(self) -> bool:
+        return len(self._failures) + len(self._session_failures) >= self.failure_threshold
 
     def _consume_current_probe(self, permit: CircuitPermit) -> bool:
         if (
@@ -302,11 +397,14 @@ class CircuitBreaker:
         self._open_total += 1
         self._generation += 1
         self._active_probe_ids.clear()
+        self._last_successful_probe_generation = None
 
     def _close(self) -> None:
         self._state = CircuitState.CLOSED
         self._opened_at = None
         self._open_deadline = None
         self._failures.clear()
+        self._session_failures.clear()
         self._generation += 1
         self._active_probe_ids.clear()
+        self._last_successful_probe_generation = None

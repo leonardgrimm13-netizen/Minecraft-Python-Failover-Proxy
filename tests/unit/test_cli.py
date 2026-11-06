@@ -296,13 +296,19 @@ async def test_async_main_returns_requested_check_result(monkeypatch: pytest.Mon
 
 
 class _FakeSignalLoop:
-    def __init__(self, *, failure: type[Exception] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        failure: type[Exception] | None = None,
+        failure_on: signal.Signals | None = None,
+    ) -> None:
         self.failure = failure
+        self.failure_on = failure_on
         self.added: list[signal.Signals] = []
         self.removed: list[signal.Signals] = []
 
     def add_signal_handler(self, caught: signal.Signals, _callback: object) -> None:
-        if self.failure is not None:
+        if self.failure is not None and (self.failure_on is None or caught == self.failure_on):
             raise self.failure
         self.added.append(caught)
 
@@ -327,10 +333,13 @@ def _patch_async_main_dependencies(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reload_enabled", [True, False])
 async def test_async_main_runs_application_registers_signals_and_warns_for_dangerous_config(
     monkeypatch: pytest.MonkeyPatch,
+    reload_enabled: bool,
 ) -> None:
     base = make_config(25565, 25566)
+    base = replace(base, reload=replace(base.reload, enabled=reload_enabled))
     config = replace(
         base,
         proxy_protocol=replace(
@@ -347,6 +356,7 @@ async def test_async_main_runs_application_registers_signals_and_warns_for_dange
     )
     application = SimpleNamespace(
         request_shutdown=MagicMock(),
+        request_reload=MagicMock(),
         run_until_stopped=AsyncMock(),
         shutdown=AsyncMock(),
     )
@@ -357,7 +367,7 @@ async def test_async_main_runs_application_registers_signals_and_warns_for_dange
     assert await cli.async_main([]) == 0
     application.run_until_stopped.assert_awaited_once_with()
     application.shutdown.assert_not_awaited()
-    assert loop.added == [signal.SIGINT, signal.SIGTERM]
+    assert loop.added == [signal.SIGINT, signal.SIGTERM, signal.SIGHUP]
     assert loop.removed == loop.added
     assert logger.critical.call_count == 2
 
@@ -370,6 +380,7 @@ async def test_async_main_tolerates_unavailable_signal_handlers(
     config = make_config(25565, 25566)
     application = SimpleNamespace(
         request_shutdown=MagicMock(),
+        request_reload=MagicMock(),
         run_until_stopped=AsyncMock(),
         shutdown=AsyncMock(),
     )
@@ -377,9 +388,17 @@ async def test_async_main_tolerates_unavailable_signal_handlers(
     logger = MagicMock()
     _patch_async_main_dependencies(monkeypatch, config, application, loop, logger)
 
+    previous = signal.SIG_DFL
+    install_ignore = MagicMock(return_value=previous)
+    monkeypatch.setattr(signal, "signal", install_ignore)
+
     assert await cli.async_main([]) == 0
-    assert logger.warning.call_count == 2
+    assert logger.warning.call_count == 3
     assert loop.removed == []
+    assert install_ignore.call_args_list == [
+        ((signal.SIGHUP, signal.SIG_IGN),),
+        ((signal.SIGHUP, previous),),
+    ]
 
 
 @pytest.mark.asyncio
@@ -389,6 +408,7 @@ async def test_async_main_handles_listener_error_and_removes_handlers(
     config = make_config(25565, 25566)
     application = SimpleNamespace(
         request_shutdown=MagicMock(),
+        request_reload=MagicMock(),
         run_until_stopped=AsyncMock(side_effect=OSError("bind failed")),
         shutdown=AsyncMock(),
     )
@@ -399,7 +419,7 @@ async def test_async_main_handles_listener_error_and_removes_handlers(
     assert await cli.async_main([]) == 1
     application.shutdown.assert_awaited_once_with()
     logger.error.assert_called_once_with("Listener startup failed error=%s", "OSError")
-    assert loop.removed == [signal.SIGINT, signal.SIGTERM]
+    assert loop.removed == [signal.SIGINT, signal.SIGTERM, signal.SIGHUP]
 
 
 @pytest.mark.asyncio
@@ -467,6 +487,7 @@ async def test_bearer_auth_does_not_report_unauthenticated_remote_monitoring(
     )
     application = SimpleNamespace(
         request_shutdown=MagicMock(),
+        request_reload=MagicMock(),
         run_until_stopped=AsyncMock(),
         shutdown=AsyncMock(),
     )
@@ -474,3 +495,25 @@ async def test_bearer_auth_does_not_report_unauthenticated_remote_monitoring(
     _patch_async_main_dependencies(monkeypatch, config, application, _FakeSignalLoop(), logger)
     assert await cli.async_main([]) == 0
     logger.critical.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exception_type", [ValueError, OSError])
+async def test_async_main_refuses_unsafe_sighup_registration(
+    monkeypatch: pytest.MonkeyPatch, exception_type: type[Exception]
+) -> None:
+    config = make_config(25565, 25566)
+    application = SimpleNamespace(
+        request_shutdown=MagicMock(),
+        request_reload=MagicMock(),
+        run_until_stopped=AsyncMock(),
+        shutdown=AsyncMock(),
+    )
+    loop = _FakeSignalLoop(failure=RuntimeError, failure_on=signal.SIGHUP)
+    logger = MagicMock()
+    _patch_async_main_dependencies(monkeypatch, config, application, loop, logger)
+    monkeypatch.setattr(signal, "signal", MagicMock(side_effect=exception_type))
+    assert await cli.async_main([]) == 1
+    application.run_until_stopped.assert_not_awaited()
+    logger.error.assert_called_once()
+    assert loop.removed == [signal.SIGINT, signal.SIGTERM]

@@ -8,7 +8,7 @@ import socket
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from .config import AppConfig
+from .config import AppConfig, configured_targets
 
 _MAX_SCOPE_ID = (2**32) - 1
 
@@ -135,19 +135,13 @@ class EndpointLoopGuard:
         self._listener_addresses: dict[_Listener, frozenset[str]] = {}
         self._local_addresses: frozenset[str] | None = None
         self._cache_lock = asyncio.Lock()
-        self._configured_endpoints = (
-            ("main", config.main.host, config.main.port),
-            ("fallback", config.fallback.host, config.fallback.port),
-            (
-                "healthcheck",
-                config.healthcheck.target_host or config.main.host,
-                config.healthcheck.target_port or config.main.port,
-            ),
-            (
-                "fallback_healthcheck",
-                config.fallback_healthcheck.target_host or config.fallback.host,
-                config.fallback_healthcheck.target_port or config.fallback.port,
-            ),
+        self._configured_endpoints = tuple(
+            endpoint
+            for name, check_name, target, check in configured_targets(config)
+            for endpoint in (
+                (name, target.host, target.port),
+                (check_name, check.target_host or target.host, check.target_port or target.port),
+            )
         )
 
     def register_bound_addresses(self, name: str, addresses: Iterable[str]) -> None:
@@ -272,6 +266,109 @@ class EndpointLoopGuard:
 
         await self._safe_addresses(host, port)
 
+    async def _open_hostname(
+        self, host: str, port: int
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """Stagger dual-stack attempts while retaining ownership of raw sockets.
+
+        CPython's staggered connect race can discard its winning raw socket on
+        cancellation. Here children only report completion; the parent owns
+        every socket before a task is launched and until transport handoff.
+        DNS answers and concurrent attempts are capped at 32. A pending
+        address never prevents the next staggered attempt from starting.
+        """
+        loop = asyncio.get_running_loop()
+        resolved = await loop.getaddrinfo(
+            host, port, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP
+        )
+        candidates = list(
+            dict.fromkeys(info for info in resolved if info[0] in {socket.AF_INET, socket.AF_INET6})
+        )
+        if not candidates:
+            raise OSError("upstream endpoint resolved to no usable addresses")
+        first_family = candidates[0][0]
+        first = [info for info in candidates if info[0] == first_family]
+        second = [info for info in candidates if info[0] != first_family]
+        ordered = [
+            group[index]
+            for index in range(max(len(first), len(second)))
+            for group in (first, second)
+            if index < len(group)
+        ][:32]
+        next_index = 0
+        pending: dict[asyncio.Task[None], socket.socket] = {}
+        owned: set[socket.socket] = set()
+        winner: socket.socket | None = None
+        last_error: OSError | None = None
+
+        def launch() -> None:
+            nonlocal next_index, last_error
+            while next_index < len(ordered):
+                family, sock_type, protocol, _name, address = ordered[next_index]
+                next_index += 1
+                try:
+                    candidate = socket.socket(family, sock_type, protocol)
+                except OSError as exc:
+                    last_error = exc
+                    continue
+                owned.add(candidate)
+                candidate.setblocking(False)
+                task = asyncio.create_task(loop.sock_connect(candidate, address))
+                pending[task] = candidate
+                return
+
+        try:
+            launch()
+            while pending:
+                can_stagger = next_index < len(ordered)
+                done, _ = await asyncio.wait(
+                    pending,
+                    timeout=0.25 if can_stagger else None,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    launch()
+                    continue
+                for task in tuple(pending):
+                    if task not in done:
+                        continue
+                    candidate = pending.pop(task)
+                    try:
+                        task.result()
+                    except OSError as exc:
+                        last_error = exc
+                        candidate.close()
+                        owned.remove(candidate)
+                    else:
+                        winner = candidate
+                        break
+                if winner is not None:
+                    break
+                if next_index < len(ordered):
+                    launch()
+            if winner is None:
+                raise last_error or OSError("upstream endpoint resolved to no usable addresses")
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            for candidate in tuple(owned):
+                if candidate is not winner:
+                    candidate.close()
+                    owned.remove(candidate)
+            reader, writer = await asyncio.open_connection(sock=winner)
+        except BaseException:
+            # Closing raw descriptors happens before cancellable task cleanup.
+            # A second cancellation therefore cannot orphan an owned socket.
+            for candidate in owned:
+                candidate.close()
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            raise
+        # No await occurs between relinquishing ownership and returning it.
+        owned.remove(winner)
+        return reader, writer
+
     async def open_connection(
         self,
         host: str,
@@ -284,13 +381,16 @@ class EndpointLoopGuard:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_seconds
         if not self._matching_listeners(port):
+            if _normalize_address(host) is not None:
+                # Numeric endpoints have no alternate DNS families to race.
+                # Avoid asyncio's staggered race: on affected CPython versions
+                # cancellation after a winning raw connect can lose ownership
+                # before its socket is handed to a StreamWriter transport.
+                return await asyncio.wait_for(
+                    asyncio.open_connection(host, port), timeout=timeout_seconds
+                )
             return await asyncio.wait_for(
-                asyncio.open_connection(
-                    host,
-                    port,
-                    happy_eyeballs_delay=0.25,
-                    interleave=1,
-                ),
+                self._open_hostname(host, port),
                 timeout=timeout_seconds,
             )
 
