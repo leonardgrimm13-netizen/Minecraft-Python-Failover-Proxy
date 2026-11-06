@@ -576,3 +576,72 @@ async def test_prepared_checks_cannot_mutate_shared_passive_state(
     assert candidate.entries["MAIN"].monitor.on_result is not None
     await candidate.entries["MAIN"].monitor.check_once()
     assert shared.quarantine_until is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["open", "half_open"])
+async def test_health_policy_reload_preserves_circuit_and_outstanding_permits(phase: str) -> None:
+    from mc_failover.models import CircuitState
+
+    clock = FakeClock()
+    config = explicit_config()
+    previous, _router = registry_router(config, clock)
+    for entry in previous.ordered:
+        for _ in range(entry.config.circuit_breaker.failure_threshold):
+            await entry.circuit.record_failure(await entry.circuit.acquire())
+    clock.advance(0.11)
+    probes = {}
+    if phase == "half_open":
+        clock.advance(0.11)
+        for entry in previous.ordered:
+            probes[entry.config.id] = await entry.circuit.acquire()
+    before = [entry.circuit.snapshot_now() for entry in previous.ordered]
+    candidate = replace(
+        config,
+        backends=tuple(
+            replace(b, healthcheck=replace(b.healthcheck, interval_seconds=60))
+            for b in config.backends
+        ),
+    )
+    current = BackendRegistry(candidate, previous=previous, clock=clock)
+    for index, entry in enumerate(current.ordered):
+        old = previous.entries[entry.config.id]
+        assert entry.health is not old.health
+        assert entry.circuit is old.circuit
+        assert entry.statistics is old.statistics
+        assert entry.circuit.snapshot_now() == before[index]
+        if phase == "half_open":
+            assert not (await entry.circuit.acquire()).allowed
+            await entry.circuit.release(probes[entry.config.id])
+        else:
+            assert entry.circuit.snapshot_now().state is CircuitState.OPEN
+            assert entry.circuit.snapshot_now().retry_after_seconds == pytest.approx(0.09)
+    if phase == "open":
+        clock.advance(0.11)
+    for entry in current.ordered:
+        probe = await entry.circuit.acquire()
+        assert probe.allowed and probe.probe
+        await entry.circuit.record_success(probe)
+        assert entry.circuit.snapshot_now().state is CircuitState.CLOSED
+
+
+@pytest.mark.parametrize("change", ["host", "port", "circuit"])
+def test_reload_never_reuses_circuit_for_changed_endpoint_or_settings(change: str) -> None:
+    config = explicit_config()
+    previous, _router = registry_router(config)
+    backend = config.backends[0]
+    if change == "host":
+        backend = replace(backend, host="127.0.0.2")
+    elif change == "port":
+        backend = replace(backend, port=27000)
+    else:
+        backend = replace(
+            backend, circuit_breaker=replace(backend.circuit_breaker, open_seconds=60)
+        )
+    current = BackendRegistry(
+        replace(config, backends=(backend, *config.backends[1:])), previous=previous
+    )
+    old, new = previous.entries["MAIN"], current.entries["MAIN"]
+    assert new.circuit is not old.circuit
+    assert (new.statistics is old.statistics) is (change == "circuit")
+    assert (new.health is old.health) is (change == "circuit")

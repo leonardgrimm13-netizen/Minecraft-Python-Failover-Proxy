@@ -20,7 +20,11 @@ _SOURCE_ROOT = Path(__file__).resolve().parents[2] / "src"
 
 @pytest.mark.skipif(not hasattr(signal, "SIGHUP"), reason="SIGHUP requires a POSIX host")
 @pytest.mark.asyncio
-async def test_cli_sighup_keeps_session_and_rejects_broken_file(tmp_path: Path) -> None:
+@pytest.mark.parametrize("reload_enabled", [True, False])
+@pytest.mark.parametrize("stop_signal", [signal.SIGTERM, signal.SIGINT])
+async def test_cli_sighup_keeps_session_and_rejects_broken_file(
+    tmp_path: Path, reload_enabled: bool, stop_signal: signal.Signals
+) -> None:
     async with running_server(echo) as main, running_server(echo) as fallback:
         proxy_port, monitor_port = await closed_local_port(), await closed_local_port()
         config_file = tmp_path / "config.toml"
@@ -50,6 +54,8 @@ listen_host = "127.0.0.1"
 listen_port = {monitor_port}
 [maintenance]
 mode = "auto"
+[reload]
+enabled = {str(reload_enabled).lower()}
 [logging]
 level = "WARNING"
 """
@@ -101,16 +107,24 @@ level = "WARNING"
             config_file.write_text(
                 text.replace('mode = "auto"', 'mode = "force_fallback"'), encoding="utf-8"
             )
-            process.send_signal(signal.SIGHUP)
-            value = await asyncio.wait_for(wait_state(2, 0), 5)
-            assert value["selected_backend"] == "FALLBACK"
-            await exchange(reader, writer, b"after real SIGHUP")
+            for count in range(3):
+                process.send_signal(signal.SIGHUP)
+                if reload_enabled:
+                    value = await asyncio.wait_for(wait_state(2 + count, 0), 5)
+                    assert value["selected_backend"] == "FALLBACK"
+                await exchange(reader, writer, b"after repeated real SIGHUP")
+                assert process.returncode is None
             config_file.write_text("[unterminated", encoding="utf-8")
             process.send_signal(signal.SIGHUP)
-            value = await asyncio.wait_for(wait_state(2, 1), 5)
-            assert value["configuration"]["last_reload_result"] == "invalid_toml"
+            if reload_enabled:
+                value = await asyncio.wait_for(wait_state(4, 1), 5)
+                assert value["configuration"]["last_reload_result"] == "invalid_toml"
+            else:
+                value = await asyncio.wait_for(state(), 2)
+                assert value["configuration"]["generation"] == 1
+                assert value["configuration"]["reload_failures"] == 0
             await exchange(reader, writer, b"after invalid real SIGHUP")
-            process.send_signal(signal.SIGTERM)
+            process.send_signal(stop_signal)
             assert await asyncio.wait_for(reader.read(), 2) == b""
             assert await asyncio.wait_for(process.wait(), 2) == 0
         finally:

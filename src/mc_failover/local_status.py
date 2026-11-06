@@ -13,6 +13,7 @@ import binascii
 import json
 import struct
 import zlib
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -245,24 +246,53 @@ def make_status_response(config: LocalStatusConfig, state: StatusState) -> bytes
     return write_varint(len(payload)) + payload
 
 
-class LocalStatusService:
-    """One service per configuration generation; no background tasks."""
+@dataclass(slots=True)
+class _StatusAdmission:
+    """Event-loop-owned budget shared by all live status generations."""
 
-    def __init__(self, config: LocalStatusConfig) -> None:
+    limit: int
+    active: int = 0
+
+
+class LocalStatusService:
+    """Generation-owned response policy with one process-wide admission budget."""
+
+    def __init__(
+        self, config: LocalStatusConfig, *, previous: LocalStatusService | None = None
+    ) -> None:
         self.config = config
-        self.active = 0
+        # Retain only the small counter, never a previous service/generation.
+        # Preparing a candidate must not change the active generation's limit.
+        self._admission: _StatusAdmission = (
+            previous._admission if previous is not None else _StatusAdmission(config.max_concurrent)
+        )
+        self._owned_leases = 0
         self._responses = {state: make_status_response(config, state) for state in StatusState}
 
+    @property
+    def active(self) -> int:
+        return self._admission.active
+
+    def activate(self) -> None:
+        """Commit the shared limit synchronously with runtime activation.
+
+        Reducing the cap preserves existing exchanges and denies new work until
+        their combined count falls below the newly configured limit.
+        """
+        self._admission.limit = self.config.max_concurrent
+
     def try_acquire(self) -> bool:
-        if self.active >= self.config.max_concurrent:
+        if self._admission.active >= self._admission.limit:
             return False
-        self.active += 1
+        self._admission.active += 1
+        self._owned_leases += 1
         return True
 
     def release(self) -> None:
-        if self.active <= 0:
+        if self._owned_leases <= 0:
             raise RuntimeError("local status lease released more than once")
-        self.active -= 1
+        self._owned_leases -= 1
+        self._admission.active -= 1
 
     async def inspect(self, reader: asyncio.StreamReader) -> HandshakeInspection:
         loop = asyncio.get_running_loop()
@@ -321,6 +351,8 @@ class LocalStatusService:
         writer: asyncio.StreamWriter,
         inspection: HandshakeInspection,
         state: str | StatusState,
+        *,
+        before_response: Callable[[], Awaitable[str]] | None = None,
     ) -> bool:
         if inspection.next_state != 1 or inspection.error is not None:
             return False
@@ -329,7 +361,8 @@ class LocalStatusService:
             # Only two exact packets are accepted, bounding framing and CPU work.
             if await reader.readexactly(2) != b"\x01\x00":
                 return False
-            writer.write(self._responses[StatusState(state)])
+            response_state = await before_response() if before_response is not None else state
+            writer.write(self._responses[StatusState(response_state)])
             await writer.drain()
             try:
                 ping = await reader.readexactly(10)

@@ -252,3 +252,23 @@ class Router:
             if permit.allowed:
                 return self._decision(entry, mode, permit=permit if entry.circuit.enabled else None)
         return self._decision(None, mode)
+
+    async def select_status_probe(self, *, shutting_down: bool = False) -> RoutingDecision:
+        """One expired circuit probe, only where no active worker can recover it.
+
+        This never probes closed circuits, bypasses quarantine/forced policy, or
+        reserves more than the circuit's existing half-open capacity.
+        """
+        mode = self.maintenance.snapshot
+        if shutting_down:
+            return self._decision(None, mode, shutting_down=True)
+        for entry in self._candidates(mode.mode):
+            if entry.config.healthcheck.enabled or not entry.routable:
+                continue
+            state = entry.circuit.snapshot_now()
+            if state.state is CircuitState.CLOSED or state.retry_after_seconds > 0:
+                continue
+            permit = await entry.circuit.acquire()
+            if permit.allowed:
+                return self._decision(entry, mode, permit=permit)
+        return self._decision(None, mode)

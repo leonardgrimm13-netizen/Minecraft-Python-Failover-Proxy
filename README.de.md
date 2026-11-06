@@ -106,12 +106,15 @@ Circuit-Einstellungen erben `[circuit_breaker]`; Health-Einstellungen verwenden 
 dokumentierten Health-Standardwerte.
 
 `[routing]` begrenzt unterschiedliche Connect-Versuche (`max_connect_attempts`, Standard
-16), die gesamte Connect-Folge (`connect_budget_seconds`, Standard 10) und gleichzeitig
+16), die gesamte Connect-Folge (`connect_budget_seconds`, Standard 10 im Multi-Backend-Modus) und gleichzeitig
 aktive Netzwerkprüfungen (`max_parallel_healthchecks`, Standard 16). Ein fehlgeschlagener
 Connect darf vor Bindung einer Backend-Sitzung den nächsten gesunden Kandidaten versuchen.
 Jeder Kandidat wird höchstens einmal versucht. Im Legacy-Schema behält
 `connect_fallback_on_main_connect_failure` seine bisherige Bedeutung. Im Multi-Backend-Modus
 versucht automatisches Routing weitere Kandidaten innerhalb dieser Grenzen.
+Ohne explizites Gesamtbudget im Legacy-Modus behalten die erlaubten MAIN-/FALLBACK-
+Versuche ihre Connect-Timeouts plus gegebenenfalls Schreibzeit für ausgehende PROXY-Header.
+Ein explizites Gesamtbudget gilt in beiden Schemata.
 
 `force_main` und `force_fallback`, einschließlich Wartungsdateien, adressieren exakt die
 IDs `MAIN` und `FALLBACK`. Benenne ein explizites Backend `FALLBACK`, wenn diese bisherigen
@@ -182,7 +185,18 @@ Dekomprimierung werden beim Konfigurationsladen geprüft. Komprimierte Metadaten
 `max_handshake_bytes = 2048` und `max_concurrent = 64` begrenzen Klassifizierung, kompletten
 Statusaustausch, Eingabepuffer und parallele Untersuchungen. VarInts sind auf fünf Bytes,
 Antwort-JSON auf 64 KiB begrenzt. Vorhandene globale, Quell-IP- und Rate-Limits gelten
-weiterhin. Wähle für Produktion Deadlines passend zur erwarteten Client-Latenz.
+weiterhin. Das Untersuchungslimit gilt gemeinsam über Reload-Generationen. Eine Absenkung
+erhält bereits zugelassene Anfragen und sperrt neue, bis die gemeinsame Anzahl unter
+die neue Grenze fällt. Wähle für Produktion Deadlines passend zur erwarteten Client-Latenz.
+
+Eine gültige lokale Statusanfrage darf höchstens einen TCP-Recovery-Probe für einen
+abgelaufenen OPEN-/HALF_OPEN-Circuit ausführen, wenn dessen aktive Checks deaktiviert
+sind. Priorität, erzwungene Policy, Quarantäne, Half-Open-Kapazität und alle Status-/
+Admission-Deadlines gelten weiterhin. Gleichzeitige Anfragen ohne Probe-Kapazität
+erhalten sofort ihre lokale Antwort. Fehlgeschlagene Probes starten die Circuit-Sperrzeit
+erneut; Cancellation gibt das Permit frei. Es entstehen keine losgelösten Probe-Tasks
+oder vom Client bestimmten Ziele. Dies belegt TCP-Erreichbarkeit, keine Bereitschaft
+von Minecraft-Welten oder Plugins. Dafür bleiben aktive Minecraft-Checks empfohlen.
 
 ## TCP-Relay und Herunterfahren
 
@@ -216,7 +230,10 @@ keine Timeout-Dauern, und angezeigte Alter/Uptime werden nie negativ.
 
 Linux-`SIGHUP` lädt bei `[reload].enabled = true` (Standard) den ursprünglichen
 Konfigurationspfad neu. Es gibt keinen öffentlichen administrativen HTTP-Endpunkt und
-keinen automatischen Dateiwächter. Wiederholte Signale werden in einem Worker zusammengefasst:
+keinen automatischen Dateiwächter. Wiederholte Signale werden in einem Worker zusammengefasst.
+Bei deaktiviertem Reload wird SIGHUP sicher ignoriert; SIGINT/SIGTERM fahren weiterhin
+geordnet herunter. Programmatisches `reload_config()` setzt ein erfolgreich beendetes
+`start()` voraus; frühere Aufrufe liefern false mit Diagnose `not_started`:
 
 ```bash
 kill -HUP <proxy-pid>
@@ -227,10 +244,16 @@ docker compose kill -s HUP mc-failover
 Ein Kandidat wird außerhalb des Event Loops eingelesen, vollständig geparst und validiert.
 DNS-/Listener-Schleifenprüfungen werden wiederholt; neue oder geänderte Backends werden
 vor Aktivierung geprüft. Eine Aktivierung ohne `await` tauscht die gesamte Generation.
-Unveränderte Endpunkte behalten gültige Health-, Circuit- und Statistikzustände;
-reine Prioritätsänderungen erhalten ihren Zustand. Geänderte Endpunkte starten frische
+Unveränderte Endpunkte behalten gültige Health-, Circuit- und Statistikzustände nach
+getrennten Kompatibilitätsregeln. Health-Policy-Änderungen erneuern Health, erhalten
+aber den Circuit samt OPEN-/HALF_OPEN-Permits bei gleicher Backend-ID, gleichem Endpunkt
+und gleichen Circuit-Einstellungen. Circuit-Änderungen ersetzen nur den Circuit;
+Endpunkt-Änderungen erzeugen frische Health-/Circuit-/Statistikzustände. Geänderte Endpunkte starten frische
 Checks. Entfernte Ziele erhalten keine neuen Sitzungen; bestehende Sitzungen behalten
-ihre ursprüngliche Konfiguration und Sockets. Alte Health- und Wartungs-Worker werden abgebrochen
+ihre ursprüngliche Transportkonfiguration und Sockets. Späte Session-Meldungen nutzen
+die aktuelle passive/frühe Fehler-Policy und den aktuellen Health-Worker nur bei
+unveränderter Backend-Instanz. Entfernte, ersetzte oder erneut hinzugefügte Ziele erhalten
+keine Meldungen alter Sessions. Alte Health- und Wartungs-Worker werden abgebrochen
 und eingesammelt. Parsing-, Validierungs- oder Vorbereitungsfehler erhalten die gesamte
 alte Generation.
 
@@ -625,3 +648,6 @@ Lizenziert unter der [MIT-Lizenz](LICENSE).
 Die finale Testmatrix, Lastmessungen und Cleanup-Regressionen stehen im
 [Validierungsbericht](docs/FEATURE-VALIDATION.md). Der vollständige
 [Abschlussbericht A–I](docs/ABSCHLUSSBERICHT-FAILOVER.md) enthält außerdem die komplette Beispielkonfiguration.
+
+Die [Korrekturen und Verifikation der unabhängigen Review](docs/PR34-REVIEW-FIXES.md)
+dokumentieren die fünf behobenen Findings und zusätzlichen Reload-Regressionen.

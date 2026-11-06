@@ -11,7 +11,7 @@ import asyncio
 import logging
 import random
 from collections import deque
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 
 from .circuit_breaker import CircuitBreaker
 from .config import AppConfig, BackendConfig, TargetConfig
@@ -164,18 +164,20 @@ class BackendRegistry:
         self._semaphore = asyncio.Semaphore(config.routing.max_parallel_healthchecks)
         for backend in config.effective_backends:
             old = previous.entries.get(backend.id) if previous is not None else None
-            statistics: BackendStatistics | None
-            policy_only = (
-                old is not None
-                and replace(
-                    old.config,
-                    priority=backend.priority,
-                    connect_timeout_seconds=backend.connect_timeout_seconds,
-                )
-                == backend
+            same_endpoint = old is not None and (old.config.host, old.config.port) == (
+                backend.host,
+                backend.port,
             )
-            if policy_only and old is not None:
-                health, circuit, statistics = old.health, old.circuit, old.statistics
+            # Each kind of state has its own compatibility boundary. Updating
+            # health policy must not bypass a circuit cooldown or lose permits.
+            reuse_health = (
+                same_endpoint
+                and old is not None
+                and old.config.healthcheck == backend.healthcheck
+                and old.config.enabled == backend.enabled
+            )
+            if reuse_health and old is not None:
+                health = old.health
                 self._reused.add(backend.id)
             else:
                 injected_health = (
@@ -188,17 +190,19 @@ class BackendRegistry:
                 health = injected_health or HealthState(
                     backend.id, backend.healthcheck, clock=clock
                 )
+            if (
+                same_endpoint
+                and old is not None
+                and old.config.circuit_breaker == backend.circuit_breaker
+            ):
+                circuit = old.circuit
+            else:
                 circuit = (
                     circuit_breaker
                     if backend.id == "MAIN" and circuit_breaker is not None and not config.backends
                     else CircuitBreaker(backend.circuit_breaker, clock=clock)
                 )
-                statistics = (
-                    old.statistics
-                    if old is not None
-                    and (old.config.host, old.config.port) == (backend.host, backend.port)
-                    else None
-                )
+            statistics = old.statistics if same_endpoint and old is not None else None
             monitor = HealthMonitor(
                 TargetConfig(backend.host, backend.port), health, endpoint_guard=endpoint_guard
             )

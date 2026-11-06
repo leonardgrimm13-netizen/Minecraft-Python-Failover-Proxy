@@ -22,7 +22,7 @@ from .proxy_protocol import (
     is_trusted_proxy,
     read_proxy_header_for_version,
 )
-from .registry import BackendRuntime
+from .registry import BackendRegistry, BackendRuntime
 from .relay import (
     PipeEnd,
     RelayErrorKind,
@@ -107,6 +107,19 @@ class ProxyServer:
     def _connection_config(self) -> AppConfig:
         snapshot = _CONNECTION_SNAPSHOT.get()
         return snapshot.config if snapshot is not None else self.config
+
+    def _observation_registry(self, origin: BackendRuntime) -> BackendRegistry | None:
+        """Dispatch late observations to the current owner of this incarnation.
+
+        Shared statistics identify an uninterrupted backend lifetime. Matching
+        just an ID/address would incorrectly deliver to a removed/re-added
+        target. No old registry or worker is retained by this dispatch path.
+        """
+        current = self.router.registry
+        entry = current.entries.get(origin.config.id)
+        if entry is None or entry.statistics is not origin.statistics:
+            return None
+        return current
 
     def _accepted(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self.runtime.incoming_connection_received()
@@ -336,7 +349,7 @@ class ProxyServer:
         registry = router.registry
         attempted: set[str] = set()
         maximum = min(config.routing.max_connect_attempts, len(registry.entries))
-        deadline = asyncio.get_running_loop().time() + config.routing.connect_budget_seconds
+        deadline = asyncio.get_running_loop().time() + config.effective_connect_budget_seconds
         for attempt in range(maximum):
             selected = decision.target
             if selected is None:
@@ -377,12 +390,16 @@ class ProxyServer:
                         RelayErrorKind.NETWORK,
                         RelayErrorKind.TIMEOUT,
                     }:
-                        registry.record_passive_failure(backend_id, "connect_failed")
+                        current = self._observation_registry(entry)
+                        if current is not None:
+                            current.record_passive_failure(backend_id, "connect_failed")
                         if permit is not None:
                             await entry.circuit.record_failure(permit)
                             resolved = True
                     else:
-                        registry.request_check(backend_id)
+                        current = self._observation_registry(entry)
+                        if current is not None:
+                            current.request_check(backend_id)
                     log.warning(
                         "Upstream connect failed backend=%s error=%s",
                         backend_id,
@@ -449,11 +466,89 @@ class ProxyServer:
         try:
             inspection = await service.inspect(reader)
             if inspection.next_state == 1:
-                await service.respond(reader, writer, inspection, state)
+
+                async def recover() -> str:
+                    if not await self._status_recovery_probe(inspection.deadline):
+                        return state
+                    preview = self.router.snapshot(shutting_down=self.runtime.shutting_down)
+                    preferred = next(
+                        (entry for entry in self.router.registry.ordered if entry.config.enabled),
+                        None,
+                    )
+                    if preview.maintenance_mode is not MaintenanceMode.AUTO:
+                        return "maintenance"
+                    if not preview.ready:
+                        return "offline"
+                    return (
+                        "fallback"
+                        if preferred is not None and preview.backend_id != preferred.config.id
+                        else "online"
+                    )
+
+                await service.respond(reader, writer, inspection, state, before_response=recover)
                 return True, b""
             return False, inspection.prefix
         finally:
             service.release()
+
+    async def _status_recovery_probe(self, deadline: float) -> bool:
+        """A valid status request may own one bounded TCP recovery probe.
+
+        Other status clients do not wait for it; the circuit enforces shared
+        half-open capacity, including across compatible reload generations.
+        No detached task, player lease, or Minecraft session is created.
+        """
+        snapshot = self._snapshot
+        if snapshot is None or self.runtime.shutting_down:
+            return False
+        decision = await snapshot.router.select_status_probe(
+            shutting_down=self.runtime.shutting_down
+        )
+        permit = decision.circuit_permit
+        if decision.target is None or permit is None:
+            return False
+        entry = snapshot.registry.entries[decision.target.id]
+        writer: asyncio.StreamWriter | None = None
+        try:
+            remaining = deadline - asyncio.get_running_loop().time()
+            timeout = min(
+                snapshot.config.status.session_timeout_seconds / 2,
+                entry.config.healthcheck.timeout_seconds,
+                entry.config.connect_timeout_seconds or snapshot.config.connection.timeout_seconds,
+                snapshot.config.effective_connect_budget_seconds,
+            )
+            # Reserve response time; a slow client must not shorten the
+            # configured probe timeout and manufacture backend failure evidence.
+            if remaining <= timeout or self.runtime.shutting_down:
+                return False
+            try:
+                _, writer = await snapshot.endpoint_guard.open_connection(
+                    entry.config.host, entry.config.port, timeout_seconds=timeout
+                )
+            except (asyncio.TimeoutError, ConnectionError, OSError) as exc:
+                evidence = _error_result("client_to_server", PipeEnd.WRITE_ERROR, 0, exc)
+                if evidence.error_kind in {
+                    RelayErrorKind.RESET,
+                    RelayErrorKind.BROKEN_PIPE,
+                    RelayErrorKind.NETWORK,
+                    RelayErrorKind.TIMEOUT,
+                }:
+                    await entry.circuit.record_failure(permit)
+                return False
+            else:
+                await entry.circuit.record_success(permit)
+                return True
+        finally:
+            # Release also covers deadline exhaustion and cancellation. Circuit
+            # verdicts consume permits, so a second release has no effect.
+            try:
+                if writer is not None:
+                    await close_stream_writer(
+                        writer,
+                        timeout_seconds=snapshot.config.connection.shutdown_cancel_timeout_seconds,
+                    )
+            finally:
+                await entry.circuit.release(permit)
 
     async def handle_client(
         self,
@@ -619,18 +714,25 @@ class ProxyServer:
                     )
                 except asyncio.TimeoutError:
                     if entry is not None and registry is not None:
-                        registry.request_check(entry.config.id)
+                        current = self._observation_registry(entry)
+                        if current is not None:
+                            current.request_check(entry.config.id)
                     return
                 except (ConnectionError, OSError) as exc:
                     outcome = classify_relay_result(
                         (_error_result("client_to_server", PipeEnd.WRITE_ERROR, 0, exc),),
                         duration_seconds=0,
                     )
-                    if outcome.backend_failure and config.passive_health.enabled:
-                        registry.record_passive_failure(entry.config.id, outcome.kind.value)
-                        await entry.circuit.record_session_failure(permit)
-                    elif outcome.confirm_health:
-                        registry.request_check(entry.config.id)
+                    current = self._observation_registry(entry)
+                    if current is not None:
+                        if outcome.backend_failure and current.config.passive_health.enabled:
+                            current.record_passive_failure(entry.config.id, outcome.kind.value)
+                            circuit = current.entries[entry.config.id].circuit
+                            await circuit.record_session_failure(
+                                permit if circuit is entry.circuit else None
+                            )
+                        elif outcome.confirm_health:
+                            current.request_check(entry.config.id)
                     return
             if config.logging.access_log:
                 log.info(
@@ -657,19 +759,23 @@ class ProxyServer:
                 drain_timeout_seconds=config.connection.relay_drain_timeout_seconds,
                 clock=self.runtime.clock,
             )
-            if entry is not None and registry is not None:
+            current = self._observation_registry(entry) if entry is not None else None
+            if entry is not None and current is not None:
                 outcome = classify_relay_result(
                     results,
                     duration_seconds=max(0.0, self.runtime.clock.monotonic() - relay_started),
-                    early_session_seconds=config.passive_health.early_session_seconds,
+                    early_session_seconds=current.config.passive_health.early_session_seconds,
                     shutting_down=self.runtime.shutting_down,
                 )
                 if outcome.backend_failure:
-                    registry.record_passive_failure(entry.config.id, outcome.kind.value)
-                    if config.passive_health.enabled:
-                        await entry.circuit.record_session_failure(permit)
+                    current.record_passive_failure(entry.config.id, outcome.kind.value)
+                    if current.config.passive_health.enabled:
+                        circuit = current.entries[entry.config.id].circuit
+                        await circuit.record_session_failure(
+                            permit if circuit is entry.circuit else None
+                        )
                 elif outcome.confirm_health:
-                    registry.request_check(entry.config.id)
+                    current.request_check(entry.config.id)
         except asyncio.CancelledError:
             raise
         except Exception:

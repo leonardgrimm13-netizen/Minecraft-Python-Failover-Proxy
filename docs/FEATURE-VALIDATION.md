@@ -114,7 +114,7 @@ includes local clients and fake backends. Connect timing includes initial handsh
 reload timing includes one concurrent byte roundtrip on every held connection. A separate
 loop-lag sampler records scheduling delay. CPU is process time; Linux `/proc` supplies
 RSS, descriptors and sockets. Use fresh processes on the same idle machine and allow
-approximately four descriptors per held client. RSS includes retained Python allocator
+approximately six descriptors per held client when concurrent status queries overlap. RSS includes retained Python allocator
 arenas and does not by itself establish a memory leak.
 
 ## Environment and available verification

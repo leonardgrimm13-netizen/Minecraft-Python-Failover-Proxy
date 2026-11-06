@@ -201,7 +201,7 @@ class FailoverApplication:
 
     def request_reload(self) -> None:
         """Coalesce local SIGHUP requests into one bounded worker."""
-        if not self.stop_event.is_set():
+        if self.config.reload.enabled and not self.stop_event.is_set():
             self._reload_event.set()
 
     async def _reload_worker(self) -> None:
@@ -289,7 +289,7 @@ class FailoverApplication:
             router,
             maintenance,
             guard,
-            LocalStatusService(candidate.status),
+            LocalStatusService(candidate.status, previous=self.snapshot.status_service),
         )
 
     @staticmethod
@@ -318,9 +318,15 @@ class FailoverApplication:
 
         Existing handlers retain their captured generation. There is no listener
         replacement and no socket belonging to an established session is closed.
+        Reloads before successful startup are rejected without preparing resources.
         """
         async with self._reload_lock:
             if self.stop_event.is_set() or not self.config.reload.enabled:
+                return False
+            if not self._started:
+                self.runtime.reload_failures += 1
+                self.runtime.last_reload_result = "not_started"
+                log.warning("Configuration reload rejected reason=not_started")
                 return False
             prepared_tasks: list[asyncio.Task[None]] = []
             activated = False
@@ -348,6 +354,7 @@ class FailoverApplication:
                 old_stop = self._generation_stop
                 # Atomic activation: all referenced objects are prepared and no
                 # operation in this section awaits, opens sockets or reads files.
+                snapshot.status_service.activate()
                 self.snapshot = snapshot
                 self.config = snapshot.config
                 self.registry = snapshot.registry

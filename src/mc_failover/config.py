@@ -152,7 +152,7 @@ class BackendConfig:
 @dataclass(frozen=True, slots=True)
 class RoutingConfig:
     max_connect_attempts: int = 16
-    connect_budget_seconds: float = 10.0
+    connect_budget_seconds: float | None = None
     max_parallel_healthchecks: int = 16
 
 
@@ -210,6 +210,31 @@ class AppConfig:
     passive_health: PassiveHealthConfig = field(default_factory=PassiveHealthConfig)
     reload: ReloadConfig = field(default_factory=ReloadConfig)
     status: LocalStatusConfig = field(default_factory=LocalStatusConfig)
+
+    @property
+    def effective_connect_budget_seconds(self) -> float:
+        """Keep legacy per-attempt timeouts unless an overall cap is explicit.
+
+        Multi-backend routing has a ten-second default total deadline. Legacy
+        MAIN/FALLBACK configurations predate that deadline and each permitted
+        attempt keeps its connect timeout plus the optional outbound PROXY
+        header write timeout.
+        """
+        if self.routing.connect_budget_seconds is not None:
+            return self.routing.connect_budget_seconds
+        if self.backends:
+            return 10.0
+        attempts = (
+            2
+            if self.connection.connect_fallback_on_main_connect_failure
+            and self.maintenance.mode is models.MaintenanceMode.AUTO
+            and self.routing.max_connect_attempts >= 2
+            else 1
+        )
+        per_attempt = self.connection.timeout_seconds
+        if self.proxy_protocol.send:
+            per_attempt += self.connection.write_timeout_seconds
+        return attempts * per_attempt
 
     @property
     def effective_backends(self) -> tuple[BackendConfig, ...]:
@@ -1360,14 +1385,17 @@ def load_config(path: Path) -> AppConfig:
             maximum=1_000_000,
             default=16,
         ),
-        connect_budget_seconds=_number(
-            routing_table,
-            "routing",
-            "connect_budget_seconds",
-            minimum=0,
-            maximum=600,
-            minimum_inclusive=False,
-            default=10,
+        connect_budget_seconds=(
+            _number(
+                routing_table,
+                "routing",
+                "connect_budget_seconds",
+                minimum=0,
+                maximum=600,
+                minimum_inclusive=False,
+            )
+            if "connect_budget_seconds" in routing_table
+            else None
         ),
         max_parallel_healthchecks=_int(
             routing_table,
@@ -1777,13 +1805,14 @@ def _validate_extensions(config: AppConfig) -> None:
     _validate_int(
         "[routing].max_parallel_healthchecks", config.routing.max_parallel_healthchecks, 1, 10_000
     )
-    _validate_number(
-        "[routing].connect_budget_seconds",
-        config.routing.connect_budget_seconds,
-        0,
-        600,
-        exclusive_minimum=True,
-    )
+    if config.routing.connect_budget_seconds is not None:
+        _validate_number(
+            "[routing].connect_budget_seconds",
+            config.routing.connect_budget_seconds,
+            0,
+            600,
+            exclusive_minimum=True,
+        )
     if not isinstance(config.passive_health, PassiveHealthConfig):
         raise ConfigError("passive_health muss PassiveHealthConfig sein")
     passive = config.passive_health

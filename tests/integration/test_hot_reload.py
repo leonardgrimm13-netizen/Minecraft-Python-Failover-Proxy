@@ -68,7 +68,13 @@ async def test_reload_preserves_live_session_and_rejects_listener_change() -> No
 @pytest.mark.asyncio
 async def test_reload_bad_file_and_shutdown_leave_current_generation(tmp_path: Path) -> None:
     config = make_config(25561, 25562, proxy_port=await closed_local_port())
+    config = replace(
+        config,
+        healthcheck=replace(config.healthcheck, enabled=False),
+        fallback_healthcheck=replace(config.fallback_healthcheck, enabled=False),
+    )
     app = FailoverApplication(config)
+    await app.start()
     bad = tmp_path / "broken.toml"
     bad.write_text("[unterminated", encoding="utf-8")
     assert not await app.reload_config(bad)
@@ -173,7 +179,13 @@ async def test_prepare_failure_and_new_task_failure_leave_old_resources(
 @pytest.mark.asyncio
 async def test_reload_preparation_is_cancelled_by_shutdown(monkeypatch: pytest.MonkeyPatch) -> None:
     config = make_config(25561, 25562, proxy_port=await closed_local_port())
+    config = replace(
+        config,
+        healthcheck=replace(config.healthcheck, enabled=False),
+        fallback_healthcheck=replace(config.fallback_healthcheck, enabled=False),
+    )
     app = FailoverApplication(config)
+    await app.start()
     entered = asyncio.Event()
 
     async def blocked_prepare(_source):
@@ -193,7 +205,14 @@ async def test_reload_preparation_is_cancelled_by_shutdown(monkeypatch: pytest.M
 async def test_caller_cancelling_reload_retains_old_configuration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    app = FailoverApplication(make_config(25561, 25562))
+    config = make_config(25561, 25562, proxy_port=await closed_local_port())
+    config = replace(
+        config,
+        healthcheck=replace(config.healthcheck, enabled=False),
+        fallback_healthcheck=replace(config.fallback_healthcheck, enabled=False),
+    )
+    app = FailoverApplication(config)
+    await app.start()
     entered = asyncio.Event()
 
     async def blocked_prepare(_source):

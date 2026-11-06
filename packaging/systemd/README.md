@@ -56,7 +56,9 @@ sudo systemctl reload mc-failover
 generation. Established sessions retain their existing backend. An invalid file or a
 change requiring restart leaves the old generation active. Inspect the journal and
 `/state` configuration diagnostics for the result: `systemctl reload` confirms signal
-delivery, not successful activation. Publish edits with an atomic rename in the same
+delivery, not successful activation. With reload disabled, SIGHUP is safely ignored
+and the proxy keeps serving existing/new sessions. SIGTERM/SIGINT still stop gracefully.
+Publish edits with an atomic rename in the same
 directory and preserve owner/group and mode `0640`.
 
 Listener, monitoring bind/cap, admission-limit and PROXY trust/framing changes require a

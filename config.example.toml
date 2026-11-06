@@ -127,8 +127,9 @@ half_open_max_attempts = 1
 # Distinct backend attempts before any session is bound; forced modes never retry elsewhere.
 # Multi-backend mode tries the next routable entry; legacy mode retains the connection flag above.
 max_connect_attempts = 16
-# Total budget for selecting/connecting all candidates, including outbound PROXY setup.
-connect_budget_seconds = 10.0
+# Optional total budget, including outbound PROXY setup.
+# Omitted: legacy preserves permitted per-attempt timeouts; multi-backend defaults to 10s.
+# connect_budget_seconds = 10.0
 # Independent backend tasks share this cap on checks doing network I/O.
 max_parallel_healthchecks = 16
 
@@ -155,6 +156,7 @@ handshake_timeout_seconds = 2.0
 session_timeout_seconds = 5.0
 max_handshake_bytes = 2048
 # Independent cap; global/source/rate limits still apply to every accepted connection.
+# Shared across all live reload generations.
 max_concurrent = 64
 # Plain text components; Minecraft section-sign formatting and newlines are supported.
 motd_online = "Minecraft network online"
@@ -173,6 +175,7 @@ protocol_version = -1
 dynamic_hint = false
 
 [reload]
+# With enabled=false SIGHUP is safely ignored; SIGINT/SIGTERM still stop gracefully.
 # Linux SIGHUP reloads supported changes atomically; disabled ignores reload requests.
 enabled = true
 # Backend/priority/health/maintenance/circuit/passive/status changes are supported.

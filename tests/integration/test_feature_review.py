@@ -181,7 +181,9 @@ async def test_failed_reload_preparation_does_not_mutate_live_passive_state(
             )
             prepared = False
 
-            def fail_resource(_config: object) -> LocalStatusService:
+            def fail_resource(
+                _config: object, *, previous: LocalStatusService | None = None
+            ) -> LocalStatusService:
                 nonlocal prepared
                 prepared = True
                 raise OSError("injected resource preparation failure")

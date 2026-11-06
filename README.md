@@ -95,12 +95,15 @@ status healthcheck fields and filters. Circuit settings inherit `[circuit_breake
 per-backend health settings use the documented health defaults.
 
 `[routing]` bounds distinct connect attempts (`max_connect_attempts`, default 16), the
-whole connect sequence (`connect_budget_seconds`, default 10), and concurrently running
+whole connect sequence (`connect_budget_seconds`, default 10 in multi-backend mode), and concurrently running
 network checks (`max_parallel_healthchecks`, default 16). A failed connect can try the
 next healthy candidate before any bytes establish a backend session. Each candidate is
 tried once. In the legacy schema, the existing
 `connect_fallback_on_main_connect_failure` switch retains its previous meaning. In
 multi-backend mode, automatic routing tries subsequent candidates within these bounds.
+When the total budget is omitted in legacy mode, the allowed MAIN/FALLBACK attempts
+retain their configured connect timeouts plus any outbound PROXY-header write allowance.
+An explicit total budget applies to either schema.
 
 `force_main` and `force_fallback`, including maintenance flags, target the exact IDs
 `MAIN` and `FALLBACK`. Name one explicit backend `FALLBACK` if those legacy overrides
@@ -166,7 +169,17 @@ Compressed metadata chunks (`iCCP`, `zTXt`, `iTXt`) are rejected before client d
 `max_handshake_bytes = 2048`, and `max_concurrent = 64` bound classification, complete
 status exchange, input buffering and parallel inspections. VarInts are limited to five
 bytes and response JSON to 64 KiB. Existing global, source and rate limits still apply.
+The inspection cap is shared across reload generations. Lowering it preserves admitted
+requests and blocks new work until the combined count falls below the new limit.
 For valid production traffic, choose deadlines that fit expected client latency.
+
+A valid local status request may perform at most one TCP recovery probe for an expired
+OPEN/HALF_OPEN circuit when that backend has active checks disabled. Priority, forced
+policy, quarantine, circuit half-open capacity and all status/admission deadlines still
+apply. Concurrent requests without probe capacity receive their local response immediately.
+A failed probe restarts the circuit cooldown; cancellation releases its permit. No
+detached probe tasks or client-supplied targets are used. This proves TCP reachability,
+not Minecraft world/plugin readiness. Keep active Minecraft checks enabled for that.
 
 ## TCP relay and shutdown
 
@@ -197,7 +210,9 @@ and displayed ages/uptime are never negative.
 
 Linux `SIGHUP` reloads the original configuration path when `[reload].enabled = true`
 (the default). There is no public administrative HTTP endpoint or automatic file watcher.
-Repeated signals coalesce in one worker. Use:
+Repeated signals coalesce in one worker. With reload disabled, SIGHUP is safely ignored;
+SIGINT/SIGTERM still shut down gracefully. Programmatic `reload_config()` requires a
+successfully completed `start()`; earlier calls return false with `not_started`. Use:
 
 ```bash
 kill -HUP <proxy-pid>
@@ -208,9 +223,15 @@ docker compose kill -s HUP mc-failover
 A candidate is read off the event loop, fully parsed and validated, DNS/listener loop
 checks are repeated, and new or changed backend checks run before activation. One
 no-await activation swaps the complete generation. Unchanged endpoints retain valid
-health, circuit and statistics; policy-only priority changes retain their state. Changed
+health, circuit and statistics under separate compatibility rules. Health-policy edits
+refresh health while retaining the circuit (including OPEN/HALF_OPEN permits) if the
+backend ID, endpoint and circuit settings match. Circuit-policy edits replace only the
+circuit; endpoint edits create fresh health/circuit/statistics. Changed
 endpoints start fresh checks. Removed endpoints receive no new sessions; existing sessions
-retain their original configuration and sockets. Retired health and maintenance workers are canceled
+retain their original transport configuration and sockets. Late session evidence uses
+the current backend passive/early-failure policy and current health worker only while
+the backend incarnation remains unchanged. Removed/replaced/re-added endpoints receive
+no old-session observations. Retired health and maintenance workers are canceled
 and collected. Failed parsing, validation or preparation keeps the whole old generation.
 
 Backend lists/priorities, healthchecks, maintenance, circuits, passive health, MOTDs,
@@ -583,3 +604,6 @@ Licensed under the [MIT License](LICENSE).
 The final test matrix, measured load results and cleanup regressions are recorded in
 [the validation report](docs/FEATURE-VALIDATION.md); the detailed German A–I delivery
 report is [available here](docs/ABSCHLUSSBERICHT-FAILOVER.md).
+
+The follow-up [independent-review fixes and verification](docs/PR34-REVIEW-FIXES.md)
+record the five corrected findings and the additional reload-boundary regressions.
